@@ -68,6 +68,8 @@ pub struct Settings {
     pub auto_push: bool,
     /// Últimas consultas escritas en el editor, de la más reciente a la más antigua.
     pub history: Vec<String>,
+    /// Intervalo de Live Watch en segundos; 0 lo apaga.
+    pub live_watch_secs: u64,
 }
 
 impl Default for Settings {
@@ -81,6 +83,7 @@ impl Default for Settings {
             recents: Vec::new(),
             auto_push: true,
             history: Vec::new(),
+            live_watch_secs: 2,
         }
     }
 }

@@ -14,9 +14,18 @@ use std::time::{Duration, Instant};
 
 const DEFAULT_SQL: &str =
     "SELECT name, type FROM sqlite_master WHERE type IN ('table', 'view') ORDER BY name;";
-const LIVE_WATCH_INTERVAL: Duration = Duration::from_secs(2);
+/// Intervalos de Live Watch en segundos (0 = apagado) y su etiqueta.
+const LIVE_WATCH_OPTIONS: [(u64, &str); 5] = [
+    (0, "Apagado"),
+    (2, "2 s"),
+    (5, "5 s"),
+    (30, "30 s"),
+    (60, "1 min"),
+];
 const MAX_RECENTS: usize = 5;
 const MAX_HISTORY: usize = 30;
+/// Altura del pie bajo la rejilla (Live Watch y paginación): separador, márgenes y controles.
+const FOOTER_HEIGHT: f32 = 48.0;
 
 struct CellEdit {
     row: usize,
@@ -144,7 +153,6 @@ pub struct DbBridgeApp {
     /// Fila (índice en `result.rows`) pendiente de confirmar su borrado.
     pending_delete: Option<usize>,
     editing: Option<CellEdit>,
-    live_watch: bool,
     last_refresh: Instant,
     dirty: bool,
     /// Se incrementa con cada cambio local; un push solo limpia `dirty` si no hubo cambios
@@ -185,7 +193,6 @@ impl DbBridgeApp {
             insert_form: None,
             pending_delete: None,
             editing: None,
-            live_watch: false,
             last_refresh: Instant::now(),
             dirty: false,
             change_revision: 0,
@@ -704,7 +711,7 @@ impl DbBridgeApp {
                     taken_at: Instant::now(),
                 });
                 self.status = if self.target.is_some() {
-                    "Línea base fijada. Usa la app y pulsa Refrescar (o activa Live Watch) para ver los cambios."
+                    "Línea base fijada. Usa la app: los cambios aparecerán en «Ver cambios» con Live Watch o al pulsar Refrescar."
                 } else {
                     "Línea base fijada. Los cambios en el archivo aparecerán en «Ver cambios»."
                 }
@@ -1349,10 +1356,11 @@ impl DbBridgeApp {
     }
 
     fn tick_live_watch(&mut self, ctx: &egui::Context) {
-        if !self.live_watch {
+        let interval = self.settings.live_watch_secs;
+        if interval == 0 {
             return;
         }
-        if self.last_refresh.elapsed() >= LIVE_WATCH_INTERVAL
+        if self.last_refresh.elapsed() >= Duration::from_secs(interval)
             && self.editing.is_none()
             // Los diálogos guardan índices de fila: no se refresca por debajo de ellos.
             && self.pending_delete.is_none()
@@ -1428,8 +1436,6 @@ impl DbBridgeApp {
                     {
                         self.persist();
                     }
-                    ui.checkbox(&mut self.live_watch, "Live Watch · 2 s")
-                        .on_hover_text("Vuelve a extraer y ejecutar la consulta cada 2 segundos.");
                 });
             });
 
@@ -1897,6 +1903,14 @@ impl DbBridgeApp {
                                 .button("Recalcular")
                                 .on_hover_text("Vuelve a comparar la copia local actual.")
                                 .clicked();
+                            ui.add_space(8.0);
+                            // De derecha a izquierda: el selector queda a la izquierda de los botones.
+                            ui.with_layout(
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    self.live_watch_selector(ui);
+                                },
+                            );
                         });
                     });
                 });
@@ -1917,7 +1931,7 @@ impl DbBridgeApp {
                             ui.add_space(4.0);
                             ui.label(
                                 RichText::new(if self.target.is_some() {
-                                    "Usa la app y pulsa Refrescar, o activa Live Watch."
+                                    "Usa la app: con Live Watch activo los cambios aparecen solos."
                                 } else {
                                     "Modifica el archivo y pulsa Recalcular."
                                 })
@@ -2303,18 +2317,10 @@ impl DbBridgeApp {
                             }
                         }
 
-                        let paged = self.result.total.filter(|total| last_page(*total) > 0);
-                        if paged.is_some() || self.result.is_editable() {
+                        if self.result.is_editable() {
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
-                                    if let Some(total) = paged {
-                                        self.pager(ui, last_page(total));
-                                        ui.add_space(8.0);
-                                    }
-                                    if !self.result.is_editable() {
-                                        return;
-                                    }
                                     if ui
                                         .add(egui::Button::new("+ Fila"))
                                         .on_hover_text("Insertar una fila nueva en la tabla.")
@@ -2340,14 +2346,34 @@ impl DbBridgeApp {
 
             ui.add(egui::Separator::default().spacing(0.0));
 
+            let schema_tab = self.results_tab == ResultsTab::Schema && self.selected.is_some();
+            let paged = self
+                .result
+                .total
+                .filter(|total| !schema_tab && last_page(*total) > 0);
             Frame::NONE
                 .inner_margin(Margin::symmetric(14, 8))
                 .show(ui, |ui| {
-                    if self.results_tab == ResultsTab::Schema && self.selected.is_some() {
+                    if schema_tab {
                         self.render_schema(ui);
-                    } else {
-                        self.render_results(ui);
+                        return;
                     }
+                    // La rejilla deja sitio al pie (Live Watch y paginación) para que quede
+                    // siempre visible al fondo de la tarjeta, debajo de las filas.
+                    self.render_results(ui, FOOTER_HEIGHT);
+                    ui.add_space((ui.available_height() - FOOTER_HEIGHT).max(0.0));
+                    ui.add_space(6.0);
+                    ui.add(egui::Separator::default().spacing(0.0));
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        self.live_watch_selector(ui);
+                        if let Some(total) = paged {
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| self.pager(ui, last_page(total)),
+                            );
+                        }
+                    });
                 });
         });
     }
@@ -2387,6 +2413,20 @@ impl DbBridgeApp {
         }
     }
 
+    fn live_watch_selector(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("Live Watch").size(12.0).color(theme::MUTED))
+            .on_hover_text(if self.target.is_some() {
+                "Vuelve a extraer la base de datos del dispositivo y a ejecutar la consulta \
+                 cada cierto tiempo. Se pausa mientras editas o hay cambios sin push."
+            } else {
+                "Vuelve a ejecutar la consulta cada cierto tiempo."
+            });
+        if theme::segmented(ui, &mut self.settings.live_watch_secs, &LIVE_WATCH_OPTIONS) {
+            self.last_refresh = Instant::now();
+            self.persist();
+        }
+    }
+
     /// Controles de página, de derecha a izquierda: » › «Página n de m» ‹ «.
     fn pager(&mut self, ui: &mut egui::Ui, last_page: usize) {
         let page = self.view.page;
@@ -2416,7 +2456,9 @@ impl DbBridgeApp {
         }
     }
 
-    fn render_results(&mut self, ui: &mut egui::Ui) {
+    /// Rejilla de resultados. `reserved` es la altura que debe quedar libre debajo (el pie de
+    /// paginación).
+    fn render_results(&mut self, ui: &mut egui::Ui, reserved: f32) {
         if self.result.columns.is_empty() {
             ui.add_space(24.0);
             ui.vertical_centered(|ui| {
@@ -2442,6 +2484,7 @@ impl DbBridgeApp {
         egui::ScrollArea::both()
             .id_salt("results_scroll")
             .auto_shrink([false, false])
+            .max_height((ui.available_height() - reserved).max(80.0))
             .show(ui, |ui| {
                 egui::Grid::new("results_grid")
                     .striped(true)
