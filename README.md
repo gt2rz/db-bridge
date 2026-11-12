@@ -17,7 +17,10 @@ Construido en Rust con `eframe`/`egui` (UI nativa, sin WebView) y `rusqlite` (SQ
 - Paginación de tablas y vistas en páginas de 200 filas, con el total de filas y controles de primera/anterior/siguiente/última. La página se conserva al refrescar y se ajusta si la tabla encoge.
 - Pantalla de bienvenida con selección de origen y conexiones recientes.
 - Editor SQL multilínea con resaltado de sintaxis, números de línea y `Ctrl/Cmd + Enter`.
-- Edición de celdas con doble clic, `Enter` para guardar y `Esc` para cancelar.
+- Edición de celdas con doble clic, `Enter` para guardar y `Esc` para cancelar. Cerrar el editor sin cambiar el valor no escribe nada.
+- Menú contextual (clic derecho) en cada celda: ver valor, copiar, poner a `NULL` y eliminar fila (con confirmación).
+- Insertar filas con **+ Fila**: un formulario por columna en el que cada campo puede quedar por defecto (`DEFAULT`, `rowid`), ser `NULL` o llevar un valor.
+- Visor de valores: JSON formateado, textos largos completos y BLOB en hexadecimal con el tipo detectado (PNG, JPEG, PDF, SQLite…) y opción de guardarlo como archivo. Los textos largos o de varias líneas se recortan en la rejilla y se abren en el visor con doble clic.
 - `Live Watch`: re-extrae y re-ejecuta la consulta cada 2 segundos.
 - Comparación con una línea base: **Fijar línea base** guarda el estado actual y **Ver cambios** muestra, por tabla, las filas insertadas, eliminadas y modificadas (celda a celda, `antes → después`), además de tablas nuevas, eliminadas o con columnas distintas. Con Live Watch la comparación se actualiza en cada extracción.
 - `Push automático` (activado por defecto): cada cambio, sea una edición de celda o un `INSERT`/`UPDATE`/`DELETE`/DDL desde el editor, se envía al simulador/dispositivo en cuanto se aplica.
@@ -88,6 +91,7 @@ src/
 ├── diff.rs        # línea base y comparación de cambios por tabla
 ├── favorites.rs   # persistencia de ajustes y favoritos
 ├── theme.rs       # paleta, fuentes del sistema y estilos de egui
+├── value_view.rs  # JSON formateado, volcado hexadecimal y tipo de BLOB
 ├── sql_highlight.rs # resaltado de sintaxis del editor SQL
 ├── tasks.rs       # operaciones lentas en hilos aparte
 └── mobile/
@@ -157,6 +161,6 @@ Las pruebas cubren listado de tablas/vistas, consultas editables, `WITHOUT ROWID
 
 - El esquema se puede consultar pero no editar (sin DDL asistido ni migraciones).
 - El editor ejecuta una sentencia por vez.
-- Los BLOB se muestran y exportan como `<BLOB n bytes>`.
+- Los BLOB se exportan a CSV/JSON como `<BLOB n bytes>` y no se pueden editar desde la tabla (sí verlos y guardarlos).
 - Las tablas con clave primaria compuesta son de solo lectura.
 - El refresh de `Live Watch` sustituye la copia temporal: si hay cambios sin push, se pausa para no perderlos.

@@ -6,6 +6,7 @@ use crate::model::{FavoriteQuery, RecentSource, Settings, SourceMode};
 use crate::sql_highlight;
 use crate::tasks::{TaskKind, Tasks};
 use crate::theme;
+use crate::value_view;
 use eframe::egui::{self, Color32, CornerRadius, Frame, Margin, RichText, Stroke};
 use rusqlite::types::Value;
 use std::path::PathBuf;
@@ -21,6 +22,42 @@ struct CellEdit {
     column: usize,
     buffer: String,
     focus_pending: bool,
+}
+
+/// Acción pedida desde el menú contextual de una celda; se aplica después de pintar la rejilla.
+enum CellAction {
+    View(usize, usize),
+    Copy(usize, usize),
+    SetNull(usize, usize),
+    Delete(usize),
+}
+
+/// Valor abierto en el visor, con su presentación ya calculada.
+struct ValueViewer {
+    title: String,
+    /// Tipo, tamaño y formato detectado.
+    summary: String,
+    body: String,
+    blob: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum FieldMode {
+    Default,
+    Null,
+    Value,
+}
+
+struct InsertField {
+    column: db::ColumnInfo,
+    mode: FieldMode,
+    text: String,
+}
+
+struct InsertForm {
+    table: String,
+    fields: Vec<InsertField>,
+    error: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -101,6 +138,10 @@ pub struct DbBridgeApp {
     results_tab: ResultsTab,
     /// Esquema de la tabla seleccionada, cargado al abrir la pestaña y guardado con su nombre.
     schema: Option<(String, Result<db::TableSchema, String>)>,
+    viewer: Option<ValueViewer>,
+    insert_form: Option<InsertForm>,
+    /// Fila (índice en `result.rows`) pendiente de confirmar su borrado.
+    pending_delete: Option<usize>,
     editing: Option<CellEdit>,
     live_watch: bool,
     last_refresh: Instant,
@@ -139,6 +180,9 @@ impl DbBridgeApp {
             result: QueryResult::default(),
             results_tab: ResultsTab::Data,
             schema: None,
+            viewer: None,
+            insert_form: None,
+            pending_delete: None,
             editing: None,
             live_watch: false,
             last_refresh: Instant::now(),
@@ -799,54 +843,63 @@ impl DbBridgeApp {
         }
     }
 
-    fn apply_edit(&mut self, row: usize, column: usize, new_text: String) {
-        let Some(path) = self.db_path.clone() else {
-            return;
-        };
+    /// Contexto para modificar una fila de la tabla seleccionada: conexión, tabla, expresión de
+    /// la clave y valor de la clave de `row`. Deja el motivo en la barra si no se puede.
+    fn row_target(&mut self, row: usize) -> Option<(rusqlite::Connection, String, String, Value)> {
+        let path = self.db_path.clone()?;
         if self.tasks.is_running(TaskKind::Pull) {
             self.status =
-                "Edición descartada: la base de datos se está volviendo a extraer.".to_string();
-            return;
+                "Cambio descartado: la base de datos se está volviendo a extraer.".to_string();
+            return None;
         }
-        let Some(object) = self.selected.clone() else {
-            self.status = "La vista actual no permite editar celdas.".to_string();
-            return;
-        };
-        let Some(key_expr) = self.result.key_expr.clone() else {
-            self.status = "La vista actual no permite editar celdas.".to_string();
-            return;
+        let (Some(object), Some(key_expr)) = (self.selected.clone(), self.result.key_expr.clone())
+        else {
+            self.status = "La vista actual no permite editar filas.".to_string();
+            return None;
         };
         let Some(key) = self.result.keys.get(row).cloned() else {
             self.status = "No se encontró la clave de la fila.".to_string();
+            return None;
+        };
+        match db::open(&path) {
+            Ok(conn) => Some((conn, object.name, key_expr, key)),
+            Err(error) => {
+                self.status = format!("Error abriendo la base de datos: {error:#}");
+                None
+            }
+        }
+    }
+
+    fn apply_edit(&mut self, row: usize, column: usize, new_text: String) {
+        let Some(current) = self.result.rows.get(row).and_then(|row| row.get(column)) else {
             return;
         };
+        // Abrir y cerrar el editor sin tocar nada no debe escribir (ni enviar al dispositivo).
+        let unchanged = match current {
+            Value::Null => new_text.is_empty() || new_text.eq_ignore_ascii_case("NULL"),
+            value => db::value_display(value) == new_text,
+        };
+        if unchanged {
+            self.status = "Sin cambios.".to_string();
+            return;
+        }
+        let new_value = if new_text.eq_ignore_ascii_case("NULL") {
+            Value::Null
+        } else {
+            Value::Text(new_text)
+        };
+        self.update_value(row, column, new_value);
+    }
+
+    fn update_value(&mut self, row: usize, column: usize, new_value: Value) {
         let Some(column_name) = self.result.columns.get(column).cloned() else {
             self.status = "No se encontró la columna.".to_string();
             return;
         };
-
-        let new_value = if new_text.eq_ignore_ascii_case("NULL") {
-            Value::Null
-        } else {
-            Value::Text(new_text.clone())
+        let Some((conn, table, key_expr, key)) = self.row_target(row) else {
+            return;
         };
-
-        let conn = match db::open(&path) {
-            Ok(conn) => conn,
-            Err(error) => {
-                self.status = format!("Error abriendo la base de datos: {error:#}");
-                return;
-            }
-        };
-
-        match db::update_cell(
-            &conn,
-            &object.name,
-            &key_expr,
-            &key,
-            &column_name,
-            &new_value,
-        ) {
+        match db::update_cell(&conn, &table, &key_expr, &key, &column_name, &new_value) {
             Ok(1) => {
                 if let Some(value) = self
                     .result
@@ -863,6 +916,304 @@ impl DbBridgeApp {
             }
             Err(error) => {
                 self.status = format!("Error actualizando la celda: {error:#}");
+            }
+        }
+    }
+
+    fn delete_row(&mut self, row: usize) {
+        let Some((conn, table, key_expr, key)) = self.row_target(row) else {
+            return;
+        };
+        match db::delete_row(&conn, &table, &key_expr, &key) {
+            Ok(0) => self.status = "La fila ya no existe.".to_string(),
+            Ok(_) => {
+                drop(conn);
+                self.run_sql();
+                self.record_change(format!("Fila eliminada de «{table}»."));
+            }
+            Err(error) => self.status = format!("Error eliminando la fila: {error:#}"),
+        }
+    }
+
+    fn open_insert_form(&mut self) {
+        let (Some(path), Some(object)) = (self.db_path.clone(), self.selected.clone()) else {
+            return;
+        };
+        let schema = db::open(&path).and_then(|conn| db::table_schema(&conn, &object.name));
+        let schema = match schema {
+            Ok(schema) => schema,
+            Err(error) => {
+                self.status = format!("No se pudo leer el esquema: {error:#}");
+                return;
+            }
+        };
+        let primary_keys = schema
+            .columns
+            .iter()
+            .filter(|column| column.primary_key > 0)
+            .count();
+        let fields = schema
+            .columns
+            .into_iter()
+            .map(|column| {
+                // INTEGER PRIMARY KEY es el rowid: SQLite lo asigna si se deja por defecto.
+                let rowid_alias = !object.without_rowid
+                    && primary_keys == 1
+                    && column.primary_key == 1
+                    && column.decl_type.eq_ignore_ascii_case("INTEGER");
+                let required = column.not_null && column.default.is_none() && !rowid_alias;
+                InsertField {
+                    mode: if required {
+                        FieldMode::Value
+                    } else {
+                        FieldMode::Default
+                    },
+                    column,
+                    text: String::new(),
+                }
+            })
+            .collect();
+        self.insert_form = Some(InsertForm {
+            table: object.name,
+            fields,
+            error: None,
+        });
+    }
+
+    fn submit_insert(&mut self) {
+        let Some(path) = self.db_path.clone() else {
+            return;
+        };
+        let Some(form) = &mut self.insert_form else {
+            return;
+        };
+        if self.tasks.is_running(TaskKind::Pull) {
+            form.error = Some("Espera a que termine la extracción en curso.".to_string());
+            return;
+        }
+        let values: Vec<(String, Value)> = form
+            .fields
+            .iter()
+            .filter_map(|field| {
+                let value = match field.mode {
+                    FieldMode::Default => return None,
+                    FieldMode::Null => Value::Null,
+                    FieldMode::Value => Value::Text(field.text.clone()),
+                };
+                Some((field.column.name.clone(), value))
+            })
+            .collect();
+        let outcome = db::open(&path).and_then(|conn| db::insert_row(&conn, &form.table, &values));
+        match outcome {
+            Ok(_) => {
+                let table = form.table.clone();
+                self.insert_form = None;
+                self.run_sql();
+                self.record_change(format!("Fila insertada en «{table}»."));
+            }
+            Err(error) => form.error = Some(format!("{error:#}")),
+        }
+    }
+
+    fn open_viewer(&mut self, row: usize, column: usize) {
+        let Some(value) = self.result.rows.get(row).and_then(|row| row.get(column)) else {
+            return;
+        };
+        let column_name = self.result.columns.get(column).cloned().unwrap_or_default();
+        let (summary, body, blob) = match value {
+            Value::Null => ("NULL".to_string(), "NULL".to_string(), None),
+            Value::Integer(number) => ("Entero".to_string(), number.to_string(), None),
+            Value::Real(number) => ("Real".to_string(), number.to_string(), None),
+            Value::Text(text) => {
+                let size = db::format_size(text.len() as u64);
+                match value_view::pretty_json(text) {
+                    Some(json) => (format!("Texto · {size} · JSON"), json, None),
+                    None => (format!("Texto · {size}"), text.clone(), None),
+                }
+            }
+            Value::Blob(bytes) => {
+                let mut summary = format!("BLOB · {}", db::format_size(bytes.len() as u64));
+                if let Some(kind) = value_view::blob_kind(bytes) {
+                    summary.push_str(&format!(" · {kind}"));
+                }
+                (summary, value_view::hex_dump(bytes), Some(bytes.clone()))
+            }
+        };
+        self.viewer = Some(ValueViewer {
+            title: format!("{column_name} · fila {}", row + 1),
+            summary,
+            body,
+            blob,
+        });
+    }
+
+    fn apply_cell_action(&mut self, ctx: &egui::Context, action: CellAction) {
+        match action {
+            CellAction::View(row, column) => self.open_viewer(row, column),
+            CellAction::Copy(row, column) => {
+                if let Some(value) = self.result.rows.get(row).and_then(|row| row.get(column)) {
+                    let text = match value {
+                        Value::Blob(bytes) => value_view::hex_dump(bytes),
+                        value => db::value_display(value),
+                    };
+                    ctx.copy_text(text);
+                    self.status = "Valor copiado al portapapeles.".to_string();
+                }
+            }
+            CellAction::SetNull(row, column) => self.update_value(row, column, Value::Null),
+            CellAction::Delete(row) => self.pending_delete = Some(row),
+        }
+    }
+
+    /// Diálogos modales: visor de valores, formulario de inserción y confirmación de borrado.
+    fn dialogs(&mut self, ctx: &egui::Context) {
+        if let Some(viewer) = &self.viewer {
+            let mut close = false;
+            let mut save = false;
+            let response = egui::Modal::new(egui::Id::unique("value_viewer")).show(ctx, |ui| {
+                ui.set_width(640.0);
+                ui.label(theme::strong(viewer.title.as_str()));
+                ui.label(
+                    RichText::new(viewer.summary.as_str())
+                        .size(12.0)
+                        .color(theme::MUTED),
+                );
+                ui.add_space(8.0);
+                egui::ScrollArea::both().max_height(420.0).show(ui, |ui| {
+                    ui.add(
+                        egui::TextEdit::multiline(&mut viewer.body.as_str())
+                            .font(egui::TextStyle::Monospace)
+                            .desired_width(f32::INFINITY),
+                    );
+                });
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Copiar").clicked() {
+                        ui.ctx().copy_text(viewer.body.clone());
+                    }
+                    if viewer.blob.is_some() && ui.button("Guardar como…").clicked() {
+                        save = true;
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        close = ui.button("Cerrar").clicked();
+                    });
+                });
+            });
+            if save && let Some(bytes) = &viewer.blob {
+                let name = format!("valor.{}", value_view::blob_extension(bytes));
+                if let Some(path) = rfd::FileDialog::new().set_file_name(name).save_file() {
+                    self.status = match std::fs::write(&path, bytes) {
+                        Ok(()) => format!("BLOB guardado en {}", path.display()),
+                        Err(error) => format!("No se pudo guardar el BLOB: {error:#}"),
+                    };
+                }
+            }
+            if close || response.should_close() {
+                self.viewer = None;
+            }
+        }
+
+        if let Some(row) = self.pending_delete {
+            let mut confirmed = false;
+            let mut cancel = false;
+            let response = egui::Modal::new(egui::Id::unique("confirm_delete")).show(ctx, |ui| {
+                ui.set_width(360.0);
+                ui.label(theme::strong(format!("¿Eliminar la fila {}?", row + 1)));
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(if self.target.is_some() && self.settings.auto_push {
+                        "Se borrará en la copia local y se enviará al dispositivo."
+                    } else {
+                        "Se borrará de la base de datos."
+                    })
+                    .size(12.0)
+                    .color(theme::MUTED),
+                );
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    let delete =
+                        egui::Button::new(theme::strong("Eliminar").color(theme::ON_ACCENT))
+                            .fill(theme::DANGER);
+                    confirmed = ui.add(delete).clicked();
+                    cancel = ui.button("Cancelar").clicked();
+                });
+            });
+            if confirmed {
+                self.pending_delete = None;
+                self.delete_row(row);
+            } else if cancel || response.should_close() {
+                self.pending_delete = None;
+            }
+        }
+
+        if self.insert_form.is_some() {
+            let mut submit = false;
+            let mut cancel = false;
+            let response = egui::Modal::new(egui::Id::unique("insert_form")).show(ctx, |ui| {
+                let Some(form) = &mut self.insert_form else {
+                    return;
+                };
+                ui.set_width(560.0);
+                ui.label(theme::strong(format!("Nueva fila en «{}»", form.table)));
+                ui.label(
+                    RichText::new(
+                        "«Por defecto» deja que SQLite asigne el valor (DEFAULT, rowid o NULL).",
+                    )
+                    .size(12.0)
+                    .color(theme::SUBTLE),
+                );
+                ui.add_space(8.0);
+                egui::ScrollArea::vertical()
+                    .max_height(380.0)
+                    .show(ui, |ui| {
+                        egui::Grid::new("insert_grid")
+                            .num_columns(3)
+                            .spacing(egui::vec2(12.0, 6.0))
+                            .show(ui, |ui| {
+                                for field in &mut form.fields {
+                                    ui.vertical(|ui| {
+                                        ui.label(theme::mono(field.column.name.as_str()));
+                                        let mut detail = field.column.decl_type.clone();
+                                        if field.column.not_null {
+                                            detail.push_str(" NOT NULL");
+                                        }
+                                        if let Some(default) = &field.column.default {
+                                            detail.push_str(&format!(" = {default}"));
+                                        }
+                                        ui.label(
+                                            RichText::new(detail).size(11.0).color(theme::SUBTLE),
+                                        );
+                                    });
+                                    let modes = [
+                                        (FieldMode::Default, "Por defecto"),
+                                        (FieldMode::Null, "NULL"),
+                                        (FieldMode::Value, "Valor"),
+                                    ];
+                                    theme::segmented(ui, &mut field.mode, &modes);
+                                    ui.add_enabled(
+                                        field.mode == FieldMode::Value,
+                                        egui::TextEdit::singleline(&mut field.text)
+                                            .font(egui::TextStyle::Monospace)
+                                            .desired_width(200.0),
+                                    );
+                                    ui.end_row();
+                                }
+                            });
+                    });
+                if let Some(error) = &form.error {
+                    ui.add_space(6.0);
+                    ui.label(RichText::new(error.as_str()).color(theme::DANGER));
+                }
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    submit = ui.add(theme::primary_button("Insertar")).clicked();
+                    cancel = ui.button("Cancelar").clicked();
+                });
+            });
+            if submit {
+                self.submit_insert();
+            } else if cancel || response.should_close() {
+                self.insert_form = None;
             }
         }
     }
@@ -939,6 +1290,9 @@ impl DbBridgeApp {
         }
         if self.last_refresh.elapsed() >= LIVE_WATCH_INTERVAL
             && self.editing.is_none()
+            // Los diálogos guardan índices de fila: no se refresca por debajo de ellos.
+            && self.pending_delete.is_none()
+            && self.insert_form.is_none()
             && !self.dirty
             && self.db_path.is_some()
             && !self.transfer_running()
@@ -1847,10 +2201,17 @@ impl DbBridgeApp {
                                     if !self.result.is_editable() {
                                         return;
                                     }
+                                    if ui
+                                        .add(egui::Button::new("+ Fila"))
+                                        .on_hover_text("Insertar una fila nueva en la tabla.")
+                                        .clicked()
+                                    {
+                                        self.open_insert_form();
+                                    }
                                     ui.add(
                                         egui::Label::new(
                                             RichText::new(
-                                                "Doble clic para editar · Enter guarda · Esc cancela · NULL vacía",
+                                                "Doble clic edita · Enter guarda · Esc cancela · clic derecho: más opciones",
                                             )
                                             .size(12.0)
                                             .color(theme::SUBTLE),
@@ -1959,6 +2320,7 @@ impl DbBridgeApp {
         let editable = self.result.is_editable();
         let mut commit: Option<(usize, usize, String)> = None;
         let mut cancel = false;
+        let mut action = None;
 
         egui::ScrollArea::both()
             .id_salt("results_scroll")
@@ -2028,25 +2390,69 @@ impl DbBridgeApp {
                                         self.editing = Some(edit);
                                     }
                                 } else {
-                                    let sense = if editable {
-                                        egui::Sense::click()
-                                    } else {
-                                        egui::Sense::hover()
+                                    let preview = match value {
+                                        Value::Text(text) => value_view::cell_preview(text),
+                                        _ => None,
+                                    };
+                                    let text = match &preview {
+                                        Some(preview) => {
+                                            theme::mono(preview.as_str()).color(theme::TEXT)
+                                        }
+                                        None => cell_text(value),
                                     };
                                     let response =
-                                        ui.add(egui::Label::new(cell_text(value)).sense(sense));
+                                        ui.add(egui::Label::new(text).sense(egui::Sense::click()));
+                                    let is_blob = matches!(value, Value::Blob(_));
                                     if response.double_clicked() {
-                                        self.editing = Some(CellEdit {
-                                            row: row_index,
-                                            column: column_index,
-                                            buffer: if matches!(value, Value::Null) {
-                                                String::new()
-                                            } else {
-                                                db::value_display(value)
-                                            },
-                                            focus_pending: true,
-                                        });
+                                        // Un BLOB o un texto largo no caben en el editor de
+                                        // una línea: se abren en el visor.
+                                        if editable && !is_blob && preview.is_none() {
+                                            self.editing = Some(CellEdit {
+                                                row: row_index,
+                                                column: column_index,
+                                                buffer: if matches!(value, Value::Null) {
+                                                    String::new()
+                                                } else {
+                                                    db::value_display(value)
+                                                },
+                                                focus_pending: true,
+                                            });
+                                        } else {
+                                            action =
+                                                Some(CellAction::View(row_index, column_index));
+                                        }
                                     }
+                                    response.context_menu(|ui| {
+                                        let cell = (row_index, column_index);
+                                        if ui.button("Ver valor").clicked() {
+                                            action = Some(CellAction::View(cell.0, cell.1));
+                                            ui.close();
+                                        }
+                                        if ui.button("Copiar valor").clicked() {
+                                            action = Some(CellAction::Copy(cell.0, cell.1));
+                                            ui.close();
+                                        }
+                                        if editable {
+                                            ui.separator();
+                                            if ui
+                                                .add_enabled(
+                                                    !matches!(value, Value::Null),
+                                                    egui::Button::new("Poner a NULL"),
+                                                )
+                                                .clicked()
+                                            {
+                                                action = Some(CellAction::SetNull(cell.0, cell.1));
+                                                ui.close();
+                                            }
+                                            let delete = egui::Button::new(
+                                                RichText::new("Eliminar fila").color(theme::DANGER),
+                                            );
+                                            if ui.add(delete).clicked() {
+                                                action = Some(CellAction::Delete(cell.0));
+                                                ui.close();
+                                            }
+                                        }
+                                    });
                                 }
                             }
                             ui.end_row();
@@ -2061,6 +2467,9 @@ impl DbBridgeApp {
         if let Some((row, column, value)) = commit {
             self.editing = None;
             self.apply_edit(row, column, value);
+        }
+        if let Some(action) = action {
+            self.apply_cell_action(&ui.ctx().clone(), action);
         }
     }
 }
@@ -2429,5 +2838,6 @@ impl eframe::App for DbBridgeApp {
         self.status_panel(ui);
         self.side_panel(ui);
         self.central_panel(ui);
+        self.dialogs(&ctx);
     }
 }

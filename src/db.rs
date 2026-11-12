@@ -458,6 +458,40 @@ pub fn update_cell(
         .context("no se pudo actualizar la celda")
 }
 
+pub fn delete_row(conn: &Connection, table: &str, key_expr: &str, key: &Value) -> Result<usize> {
+    let sql = format!("DELETE FROM {} WHERE {} = ?1", quote_ident(table), key_expr);
+    conn.execute(&sql, [key])
+        .context("no se pudo eliminar la fila")
+}
+
+/// Inserta una fila con los valores indicados; el resto de columnas toma su valor por
+/// defecto. Devuelve el `rowid` de la fila nueva (0 en tablas `WITHOUT ROWID`).
+pub fn insert_row(conn: &Connection, table: &str, values: &[(String, Value)]) -> Result<i64> {
+    let sql = if values.is_empty() {
+        format!("INSERT INTO {} DEFAULT VALUES", quote_ident(table))
+    } else {
+        let columns = values
+            .iter()
+            .map(|(column, _)| quote_ident(column))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let placeholders = (1..=values.len())
+            .map(|index| format!("?{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "INSERT INTO {} ({columns}) VALUES ({placeholders})",
+            quote_ident(table)
+        )
+    };
+    conn.execute(
+        &sql,
+        rusqlite::params_from_iter(values.iter().map(|(_, value)| value)),
+    )
+    .context("no se pudo insertar la fila")?;
+    Ok(conn.last_insert_rowid())
+}
+
 /// Tamaño en disco del archivo principal y de su `-wal` (0 si no existe).
 pub fn disk_size(path: &Path) -> Option<(u64, u64)> {
     let main = std::fs::metadata(path).ok()?.len();
@@ -743,6 +777,41 @@ mod tests {
         assert_eq!(schema.columns.len(), 1);
         assert!(schema.indexes.is_empty());
         assert!(schema.sql.unwrap().starts_with("CREATE VIEW"));
+    }
+
+    #[test]
+    fn inserts_with_defaults_and_deletes_by_key() {
+        let conn = memory();
+        let id = insert_row(
+            &conn,
+            "items",
+            &[
+                ("name".to_string(), Value::Text("cable".to_string())),
+                ("qty".to_string(), Value::Text("7".to_string())),
+            ],
+        )
+        .unwrap();
+        assert_eq!(id, 3);
+        // La afinidad INTEGER convierte el texto escrito en el formulario.
+        let qty: Value = conn
+            .query_row("SELECT qty FROM items WHERE id = 3", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(qty, Value::Integer(7));
+
+        assert!(insert_row(&conn, "items", &[]).is_err(), "name es NOT NULL");
+
+        assert_eq!(
+            delete_row(&conn, "items", "rowid", &Value::Integer(3)).unwrap(),
+            1
+        );
+        assert_eq!(
+            delete_row(&conn, "kv", "\"k\"", &Value::Text("a".to_string())).unwrap(),
+            1
+        );
+        let remaining: i64 = conn
+            .query_row("SELECT COUNT(*) FROM items", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(remaining, 2);
     }
 
     #[test]
