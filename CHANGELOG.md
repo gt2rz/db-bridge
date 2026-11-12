@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.3](https://github.com/gt2rz/db-bridge/compare/v0.1.2...v0.1.3) (2026-11-12)
+
+
+### Novedades
+
+* actualizar la app desde la propia app en macOS, Windows y Linux ([116caf8](https://github.com/gt2rz/db-bridge/commit/116caf81b4eaeb16f7738a235316e01f6b248213))
+
 ## [0.1.2](https://github.com/gt2rz/db-bridge/compare/v0.1.1...v0.1.2) (2026-11-12)
 
 
