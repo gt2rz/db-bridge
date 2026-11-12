@@ -10,6 +10,7 @@ mod model;
 mod sql_highlight;
 mod tasks;
 mod theme;
+mod update_check;
 mod value_view;
 
 use app::DbBridgeApp;

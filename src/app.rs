@@ -6,6 +6,7 @@ use crate::model::{FavoriteQuery, RecentSource, Settings, SourceMode};
 use crate::sql_highlight;
 use crate::tasks::{TaskKind, Tasks};
 use crate::theme;
+use crate::update_check::{self, Release};
 use crate::value_view;
 use eframe::egui::{self, Color32, CornerRadius, Frame, Margin, RichText, Stroke};
 use rusqlite::types::Value;
@@ -126,6 +127,7 @@ enum TaskOutput {
         message: Option<String>,
         result: anyhow::Result<()>,
     },
+    LatestRelease(anyhow::Result<Release>),
 }
 
 pub struct DbBridgeApp {
@@ -172,7 +174,7 @@ impl DbBridgeApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         theme::install(&cc.egui_ctx);
 
-        Self {
+        let mut app = Self {
             settings: favorites::load(),
             detected_devices: Vec::new(),
             detected_apps: Vec::new(),
@@ -202,7 +204,9 @@ impl DbBridgeApp {
             diff: None,
             status: "Abre un archivo o extrae la base de datos de un emulador.".to_string(),
             new_favorite_name: String::new(),
-        }
+        };
+        app.check_for_updates(false);
+        app
     }
 
     fn persist(&mut self) {
@@ -615,6 +619,7 @@ impl DbBridgeApp {
                     message,
                     result,
                 }) => self.finish_push(revision, message, result),
+                Some(TaskOutput::LatestRelease(result)) => self.finish_check_for_updates(result),
                 None => {
                     self.status = format!("Error inesperado: «{}» se interrumpió.", kind.label());
                 }
@@ -1340,6 +1345,81 @@ impl DbBridgeApp {
         self.status = "Consulta guardada en favoritos.".to_string();
     }
 
+    /// Consulta la última Release en segundo plano si está activado y toca (o si `force`).
+    fn check_for_updates(&mut self, force: bool) {
+        if !self.settings.check_updates || self.tasks.is_running(TaskKind::CheckUpdate) {
+            return;
+        }
+        if !force
+            && !update_check::is_due(self.settings.last_update_check, update_check::now_secs())
+        {
+            return;
+        }
+        self.tasks.spawn(TaskKind::CheckUpdate, || {
+            TaskOutput::LatestRelease(update_check::fetch_latest())
+        });
+    }
+
+    /// Sin red o con GitHub caído no se avisa de nada: se reintenta en el próximo arranque.
+    fn finish_check_for_updates(&mut self, result: anyhow::Result<Release>) {
+        if let Ok(release) = result {
+            self.settings.last_update_check = update_check::now_secs();
+            self.settings.latest_release = Some(release);
+            self.persist();
+        }
+    }
+
+    /// Release que merece aviso: más nueva que la instalada y no omitida por el usuario.
+    fn available_update(&self) -> Option<&Release> {
+        self.settings.latest_release.as_ref().filter(|release| {
+            self.settings.check_updates
+                && release.version != self.settings.skipped_version
+                && update_check::is_newer(&release.version, update_check::CURRENT_VERSION)
+        })
+    }
+
+    fn update_banner(&mut self, ui: &mut egui::Ui) {
+        let Some(release) = self.available_update().cloned() else {
+            return;
+        };
+        let frame = Frame::NONE
+            .fill(theme::RAISED)
+            .inner_margin(Margin::symmetric(16, 6));
+        egui::Panel::top("update_banner")
+            .frame(frame)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    theme::dot(ui, theme::ACCENT, 3.5);
+                    ui.label(
+                        RichText::new(format!(
+                            "Hay una versión nueva de DB Bridge: {} (tienes la {}).",
+                            release.version,
+                            update_check::CURRENT_VERSION
+                        ))
+                        .size(12.5)
+                        .color(theme::TEXT),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .button("Omitir esta versión")
+                            .on_hover_text("No volver a avisar hasta que salga otra.")
+                            .clicked()
+                        {
+                            self.settings.skipped_version = release.version.clone();
+                            self.persist();
+                        }
+                        if ui
+                            .add(theme::primary_button("Descargar"))
+                            .on_hover_text("Abre la página de la Release con las novedades.")
+                            .clicked()
+                        {
+                            ui.ctx().open_url(egui::OpenUrl::new_tab(&release.url));
+                        }
+                    });
+                });
+            });
+    }
+
     fn handle_dropped_files(&mut self, ctx: &egui::Context) {
         let dropped = ctx.input(|input| {
             input
@@ -1621,6 +1701,7 @@ impl DbBridgeApp {
                         );
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        self.version_menu(ui);
                         if let Some(path) = &self.db_path {
                             ui.label(
                                 theme::mono(path.display().to_string())
@@ -1631,6 +1712,55 @@ impl DbBridgeApp {
                     });
                 });
             });
+    }
+
+    fn version_menu(&mut self, ui: &mut egui::Ui) {
+        let label = RichText::new(format!("v{}", update_check::CURRENT_VERSION))
+            .size(11.5)
+            .color(theme::SUBTLE);
+        ui.menu_button(label, |ui| {
+            if ui
+                .checkbox(
+                    &mut self.settings.check_updates,
+                    "Buscar actualizaciones al iniciar",
+                )
+                .on_hover_text(
+                    "Consulta GitHub como mucho una vez al día. No se envía ningún dato.",
+                )
+                .changed()
+            {
+                self.persist();
+                self.check_for_updates(false);
+            }
+            let checking = self.tasks.is_running(TaskKind::CheckUpdate);
+            if ui
+                .add_enabled(
+                    self.settings.check_updates && !checking,
+                    egui::Button::new("Buscar ahora"),
+                )
+                .clicked()
+            {
+                // Al buscar a mano se vuelve a avisar aunque se hubiera omitido la versión.
+                self.settings.skipped_version.clear();
+                self.check_for_updates(true);
+            }
+            match &self.settings.latest_release {
+                Some(release)
+                    if update_check::is_newer(&release.version, update_check::CURRENT_VERSION) =>
+                {
+                    if ui
+                        .button(format!("Descargar la {}", release.version))
+                        .clicked()
+                    {
+                        ui.ctx().open_url(egui::OpenUrl::new_tab(&release.url));
+                    }
+                }
+                Some(_) => {
+                    ui.weak("Tienes la última versión.");
+                }
+                None => {}
+            }
+        });
     }
 
     fn side_panel(&mut self, ui: &mut egui::Ui) {
@@ -3016,6 +3146,7 @@ impl eframe::App for DbBridgeApp {
         self.handle_dropped_files(&ctx);
         self.tick_live_watch(&ctx);
 
+        self.update_banner(ui);
         self.top_panel(ui);
         self.status_panel(ui);
         self.side_panel(ui);

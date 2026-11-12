@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+use crate::update_check::Release;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
 pub enum SourceMode {
     #[default]
@@ -70,6 +72,14 @@ pub struct Settings {
     pub history: Vec<String>,
     /// Intervalo de Live Watch en segundos; 0 lo apaga.
     pub live_watch_secs: u64,
+    /// Consulta en GitHub, como mucho una vez al día, si hay una versión nueva.
+    pub check_updates: bool,
+    /// Momento (segundos Unix) de la última consulta de versiones.
+    pub last_update_check: u64,
+    /// Última Release estable conocida; se guarda para seguir avisando entre consultas.
+    pub latest_release: Option<Release>,
+    /// Versión que el usuario decidió omitir.
+    pub skipped_version: String,
 }
 
 impl Default for Settings {
@@ -84,6 +94,10 @@ impl Default for Settings {
             auto_push: true,
             history: Vec::new(),
             live_watch_secs: 2,
+            check_updates: true,
+            last_update_check: 0,
+            latest_release: None,
+            skipped_version: String::new(),
         }
     }
 }

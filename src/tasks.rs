@@ -11,6 +11,7 @@ pub enum TaskKind {
     DetectDatabases,
     Pull,
     Push,
+    CheckUpdate,
 }
 
 impl TaskKind {
@@ -21,6 +22,7 @@ impl TaskKind {
             Self::DetectDatabases => "Buscando bases de datos…",
             Self::Pull => "Extrayendo base de datos…",
             Self::Push => "Enviando al dispositivo…",
+            Self::CheckUpdate => "Buscando actualizaciones…",
         }
     }
 }
