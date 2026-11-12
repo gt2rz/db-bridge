@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.2](https://github.com/gt2rz/db-bridge/compare/v0.1.1...v0.1.2) (2026-11-12)
+
+
+### Correcciones
+
+* avisar cuando la detección no encuentra dispositivos y sugerir el otro modo ([35e02d9](https://github.com/gt2rz/db-bridge/commit/35e02d9d8ac8a513cb94661e597672b6548fcbd6))
+
 ## [0.1.1](https://github.com/gt2rz/db-bridge/compare/v0.1.0...v0.1.1) (2026-11-12)
 
 
