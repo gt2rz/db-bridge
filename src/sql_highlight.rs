@@ -201,13 +201,13 @@ pub fn layout_job(text: &str, font_id: FontId) -> LayoutJob {
 
 fn color(kind: TokenKind) -> Color32 {
     match kind {
-        TokenKind::Keyword => theme::KEYWORD,
-        TokenKind::QuotedIdentifier => theme::IDENT,
-        TokenKind::String => theme::STRING,
-        TokenKind::Number => theme::NUMBER,
-        TokenKind::Comment => theme::SUBTLE,
-        TokenKind::Punctuation => theme::MUTED,
-        TokenKind::Identifier | TokenKind::Whitespace => theme::TEXT,
+        TokenKind::Keyword => theme::keyword(),
+        TokenKind::QuotedIdentifier => theme::ident(),
+        TokenKind::String => theme::string(),
+        TokenKind::Number => theme::number(),
+        TokenKind::Comment => theme::subtle(),
+        TokenKind::Punctuation => theme::muted(),
+        TokenKind::Identifier | TokenKind::Whitespace => theme::text(),
     }
 }
 

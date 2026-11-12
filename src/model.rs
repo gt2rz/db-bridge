@@ -29,6 +29,15 @@ impl SourceMode {
     }
 }
 
+/// Tema de la interfaz; `Auto` sigue el del sistema.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+pub enum ThemeMode {
+    #[default]
+    Auto,
+    Light,
+    Dark,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FavoriteQuery {
     pub name: String,
@@ -80,6 +89,7 @@ pub struct Settings {
     pub latest_release: Option<Release>,
     /// Versión que el usuario decidió omitir.
     pub skipped_version: String,
+    pub theme: ThemeMode,
 }
 
 impl Default for Settings {
@@ -98,6 +108,7 @@ impl Default for Settings {
             last_update_check: 0,
             latest_release: None,
             skipped_version: String::new(),
+            theme: ThemeMode::default(),
         }
     }
 }

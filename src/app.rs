@@ -2,7 +2,7 @@ use crate::db::{self, DbObject, ObjectKind, QueryResult};
 use crate::diff::{self, DatabaseDiff, TableChange, TableDiff};
 use crate::favorites;
 use crate::mobile::{self, Device};
-use crate::model::{FavoriteQuery, RecentSource, Settings, SourceMode};
+use crate::model::{FavoriteQuery, RecentSource, Settings, SourceMode, ThemeMode};
 use crate::sql_highlight;
 use crate::tasks::{TaskKind, Tasks};
 use crate::theme;
@@ -198,10 +198,11 @@ pub struct DbBridgeApp {
 
 impl DbBridgeApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        theme::install(&cc.egui_ctx);
+        let settings = favorites::load();
+        theme::install(&cc.egui_ctx, settings.theme);
 
         let mut app = Self {
-            settings: favorites::load(),
+            settings,
             detected_devices: Vec::new(),
             detected_apps: Vec::new(),
             detected_dbs: Vec::new(),
@@ -1233,7 +1234,7 @@ impl DbBridgeApp {
                 ui.label(
                     RichText::new(viewer.summary.as_str())
                         .size(12.0)
-                        .color(theme::MUTED),
+                        .color(theme::muted()),
                 );
                 ui.add_space(8.0);
                 egui::ScrollArea::both().max_height(420.0).show(ui, |ui| {
@@ -1284,13 +1285,13 @@ impl DbBridgeApp {
                         "Se borrará de la base de datos."
                     })
                     .size(12.0)
-                    .color(theme::MUTED),
+                    .color(theme::muted()),
                 );
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
                     let delete =
-                        egui::Button::new(theme::strong("Eliminar").color(theme::ON_ACCENT))
-                            .fill(theme::DANGER);
+                        egui::Button::new(theme::strong("Eliminar").color(theme::on_accent()))
+                            .fill(theme::danger());
                     confirmed = ui.add(delete).clicked();
                     cancel = ui.button("Cancelar").clicked();
                 });
@@ -1317,7 +1318,7 @@ impl DbBridgeApp {
                         "«Por defecto» deja que SQLite asigne el valor (DEFAULT, rowid o NULL).",
                     )
                     .size(12.0)
-                    .color(theme::SUBTLE),
+                    .color(theme::subtle()),
                 );
                 ui.add_space(8.0);
                 egui::ScrollArea::vertical()
@@ -1338,7 +1339,7 @@ impl DbBridgeApp {
                                             detail.push_str(&format!(" = {default}"));
                                         }
                                         ui.label(
-                                            RichText::new(detail).size(11.0).color(theme::SUBTLE),
+                                            RichText::new(detail).size(11.0).color(theme::subtle()),
                                         );
                                     });
                                     let modes = [
@@ -1359,7 +1360,7 @@ impl DbBridgeApp {
                     });
                 if let Some(error) = &form.error {
                     ui.add_space(6.0);
-                    ui.label(RichText::new(error.as_str()).color(theme::DANGER));
+                    ui.label(RichText::new(error.as_str()).color(theme::danger()));
                 }
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
@@ -1513,37 +1514,37 @@ impl DbBridgeApp {
         let mut install = false;
         let mut restart = false;
         let frame = Frame::NONE
-            .fill(theme::RAISED)
+            .fill(theme::raised())
             .inner_margin(Margin::symmetric(16, 6));
         egui::Panel::top("update_banner")
             .frame(frame)
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     let message = if installing {
-                        ui.add(egui::Spinner::new().size(12.0).color(theme::ACCENT));
+                        ui.add(egui::Spinner::new().size(12.0).color(theme::accent()));
                         format!("Descargando e instalando DB Bridge {}…", release.version)
                     } else if installed {
-                        theme::dot(ui, theme::SUCCESS, 3.5);
+                        theme::dot(ui, theme::success(), 3.5);
                         format!(
                             "DB Bridge {} está instalado. Reinicia para usarlo.",
                             release.version
                         )
                     } else {
-                        theme::dot(ui, theme::ACCENT, 3.5);
+                        theme::dot(ui, theme::accent(), 3.5);
                         format!(
                             "Hay una versión nueva de DB Bridge: {} (tienes la {}).",
                             release.version,
                             update_check::CURRENT_VERSION
                         )
                     };
-                    ui.label(RichText::new(message).size(12.5).color(theme::TEXT));
+                    ui.label(RichText::new(message).size(12.5).color(theme::text()));
                     if !installing && let Some(UpdateInstall::Failed(error)) = &self.update_install
                     {
                         ui.add(
                             egui::Label::new(
                                 RichText::new(format!("No se pudo actualizar: {error}"))
                                     .size(12.0)
-                                    .color(theme::WARNING),
+                                    .color(theme::warning()),
                             )
                             .truncate(),
                         );
@@ -1652,21 +1653,21 @@ impl DbBridgeApp {
     fn status_color(&self) -> Color32 {
         let status = self.status.as_str();
         if status.starts_with("Error") || status.starts_with("No se pudo") {
-            theme::DANGER
+            theme::danger()
         } else if self.db_path.is_some() {
-            theme::SUCCESS
+            theme::success()
         } else {
-            theme::FAINT
+            theme::faint()
         }
     }
 
     fn top_panel(&mut self, ui: &mut egui::Ui) {
         let frame = Frame::NONE
-            .fill(theme::SURFACE)
+            .fill(theme::surface())
             .inner_margin(Margin::symmetric(16, 10));
         egui::Panel::top("top_panel").frame(frame).show(ui, |ui| {
             ui.horizontal(|ui| {
-                theme::dot(ui, theme::ACCENT, 5.0);
+                theme::dot(ui, theme::accent(), 5.0);
                 ui.label(theme::strong("DB Bridge").size(14.5));
                 ui.add_space(12.0);
 
@@ -1678,6 +1679,20 @@ impl DbBridgeApp {
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let themes = [
+                        (ThemeMode::Dark, "Oscuro"),
+                        (ThemeMode::Light, "Claro"),
+                        (ThemeMode::Auto, "Auto"),
+                    ];
+                    let mut mode = self.settings.theme;
+                    // En un layout de derecha a izquierda las opciones se dibujan al revés.
+                    if theme::segmented(ui, &mut mode, &themes) {
+                        self.settings.theme = mode;
+                        theme::set_mode(ui.ctx(), mode);
+                        self.persist();
+                    }
+                    ui.add_space(4.0);
+
                     let transfer_idle = !self.transfer_running();
                     if self.db_path.is_some()
                         && self.target.is_some()
@@ -1776,7 +1791,7 @@ impl DbBridgeApp {
                         } else {
                             egui::ComboBox::from_id_salt("app_selector")
                                 .selected_text(if self.settings.app_id.is_empty() {
-                                    RichText::new("Selecciona una app").color(theme::SUBTLE)
+                                    RichText::new("Selecciona una app").color(theme::subtle())
                                 } else {
                                     theme::mono(self.settings.app_id.as_str())
                                 })
@@ -1863,11 +1878,11 @@ impl DbBridgeApp {
             {
                 ui.add_space(6.0);
                 ui.horizontal_wrapped(|ui| {
-                    theme::dot(ui, theme::WARNING, 3.5);
+                    theme::dot(ui, theme::warning(), 3.5);
                     ui.label(
                         RichText::new(notice.message.as_str())
                             .size(12.5)
-                            .color(theme::WARNING),
+                            .color(theme::warning()),
                     );
                     if let Some(mode) = notice.switch_to
                         && ui.button(format!("Cambiar a {}", mode.label())).clicked()
@@ -1884,31 +1899,31 @@ impl DbBridgeApp {
 
     fn status_panel(&mut self, ui: &mut egui::Ui) {
         let frame = Frame::NONE
-            .fill(theme::SURFACE)
+            .fill(theme::surface())
             .inner_margin(Margin::symmetric(16, 5));
         egui::Panel::bottom("status_panel")
             .frame(frame)
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     if let Some(kind) = self.tasks.running().last() {
-                        ui.add(egui::Spinner::new().size(12.0).color(theme::ACCENT));
-                        ui.label(RichText::new(kind.label()).size(12.0).color(theme::TEXT));
+                        ui.add(egui::Spinner::new().size(12.0).color(theme::accent()));
+                        ui.label(RichText::new(kind.label()).size(12.0).color(theme::text()));
                         ui.add_space(8.0);
                     }
                     theme::dot(ui, self.status_color(), 3.5);
                     ui.add(
                         egui::Label::new(
-                            RichText::new(&self.status).size(12.0).color(theme::MUTED),
+                            RichText::new(&self.status).size(12.0).color(theme::muted()),
                         )
                         .truncate(),
                     );
                     if self.dirty {
                         ui.add_space(8.0);
-                        theme::dot(ui, theme::WARNING, 3.5);
+                        theme::dot(ui, theme::warning(), 3.5);
                         ui.label(
                             RichText::new("Cambios sin push")
                                 .size(12.0)
-                                .color(theme::WARNING),
+                                .color(theme::warning()),
                         );
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1917,7 +1932,7 @@ impl DbBridgeApp {
                             ui.label(
                                 theme::mono(path.display().to_string())
                                     .size(11.5)
-                                    .color(theme::SUBTLE),
+                                    .color(theme::subtle()),
                             );
                         }
                     });
@@ -1928,7 +1943,7 @@ impl DbBridgeApp {
     fn version_menu(&mut self, ui: &mut egui::Ui) {
         let label = RichText::new(format!("v{}", update_check::CURRENT_VERSION))
             .size(11.5)
-            .color(theme::SUBTLE);
+            .color(theme::subtle());
         ui.menu_button(label, |ui| {
             if ui
                 .checkbox(
@@ -1977,7 +1992,7 @@ impl DbBridgeApp {
 
     fn side_panel(&mut self, ui: &mut egui::Ui) {
         let frame = Frame::NONE
-            .fill(theme::SIDEBAR)
+            .fill(theme::sidebar())
             .inner_margin(Margin::symmetric(12, 14));
         egui::Panel::left("side_panel")
             .resizable(true)
@@ -1995,7 +2010,7 @@ impl DbBridgeApp {
                             ui.label(
                                 RichText::new(self.objects.len().to_string())
                                     .size(11.5)
-                                    .color(theme::SUBTLE),
+                                    .color(theme::subtle()),
                             );
                         });
                     }
@@ -2031,15 +2046,15 @@ impl DbBridgeApp {
                                 _ => "",
                             };
                             let name_color = if selected {
-                                theme::TEXT
+                                theme::text()
                             } else {
-                                theme::TEXT_SOFT
+                                theme::text_soft()
                             };
                             let button = egui::Button::selectable(
                                 selected,
                                 theme::mono(object.name.as_str()).color(name_color),
                             )
-                            .right_text(RichText::new(tag).size(11.0).color(theme::SUBTLE))
+                            .right_text(RichText::new(tag).size(11.0).color(theme::subtle()))
                             .min_size(egui::vec2(ui.available_width(), 28.0));
                             let is_view = object.kind == ObjectKind::View;
                             let response = ui.add(button);
@@ -2079,7 +2094,7 @@ impl DbBridgeApp {
                                 let button = egui::Button::selectable(
                                     false,
                                     RichText::new(format!("★  {}", favorite.name))
-                                        .color(theme::TEXT_SOFT),
+                                        .color(theme::text_soft()),
                                 )
                                 .right_text("")
                                 .min_size(egui::vec2(width, 28.0));
@@ -2092,7 +2107,7 @@ impl DbBridgeApp {
                                     self.run_sql();
                                 }
                                 let delete = egui::Button::new(
-                                    RichText::new("×").size(15.0).color(theme::SUBTLE),
+                                    RichText::new("×").size(15.0).color(theme::subtle()),
                                 )
                                 .frame_when_inactive(false)
                                 .min_size(egui::vec2(28.0, 28.0));
@@ -2116,12 +2131,12 @@ impl DbBridgeApp {
             match &self.db_path {
                 Some(path) => {
                     ui.horizontal(|ui| {
-                        theme::dot(ui, theme::SUCCESS, 4.0);
+                        theme::dot(ui, theme::success(), 4.0);
                         ui.label(theme::strong(self.settings.mode.label()));
                     });
                     if let Some(origin) = &self.origin {
                         ui.add(
-                            egui::Label::new(theme::mono(origin.as_str()).color(theme::MUTED))
+                            egui::Label::new(theme::mono(origin.as_str()).color(theme::muted()))
                                 .truncate(),
                         )
                         .on_hover_text(path.display().to_string());
@@ -2133,7 +2148,7 @@ impl DbBridgeApp {
                             text.push_str(&format!(" · WAL {}", db::format_size(wal)));
                             detail.push_str(&format!(" + {wal} bytes de WAL"));
                         }
-                        ui.label(RichText::new(text).size(12.0).color(theme::SUBTLE))
+                        ui.label(RichText::new(text).size(12.0).color(theme::subtle()))
                             .on_hover_text(detail);
                     }
                     ui.add_space(6.0);
@@ -2141,13 +2156,13 @@ impl DbBridgeApp {
                 }
                 None => {
                     ui.horizontal(|ui| {
-                        theme::dot(ui, theme::FAINT, 4.0);
+                        theme::dot(ui, theme::faint(), 4.0);
                         ui.label(theme::strong("Sin conexión"));
                     });
                     ui.label(
                         RichText::new("Abre un archivo o extrae la BD de un dispositivo.")
                             .size(12.0)
-                            .color(theme::SUBTLE),
+                            .color(theme::subtle()),
                     );
                 }
             }
@@ -2172,11 +2187,11 @@ impl DbBridgeApp {
             Some(baseline) => {
                 let age = format_age(baseline.taken_at.elapsed());
                 ui.horizontal(|ui| {
-                    theme::dot(ui, theme::ACCENT, 3.5);
+                    theme::dot(ui, theme::accent(), 3.5);
                     ui.label(
                         RichText::new(format!("Línea base · {age}"))
                             .size(12.0)
-                            .color(theme::MUTED),
+                            .color(theme::muted()),
                     );
                 });
                 ui.horizontal(|ui| {
@@ -2200,7 +2215,7 @@ impl DbBridgeApp {
                         self.set_baseline();
                     }
                     let discard =
-                        egui::Button::new(RichText::new("×").size(15.0).color(theme::SUBTLE))
+                        egui::Button::new(RichText::new("×").size(15.0).color(theme::subtle()))
                             .frame_when_inactive(false);
                     if ui
                         .add(discard)
@@ -2234,7 +2249,7 @@ impl DbBridgeApp {
                         if let Some(baseline) = &self.baseline {
                             ui.label(
                                 RichText::new(format_age(baseline.taken_at.elapsed()))
-                                    .color(theme::MUTED),
+                                    .color(theme::muted()),
                             );
                         }
                         let (inserted, deleted, updated) = diff.totals();
@@ -2268,7 +2283,7 @@ impl DbBridgeApp {
                             ui.label(
                                 RichText::new("Sin cambios desde la línea base")
                                     .family(theme::semibold())
-                                    .color(theme::TEXT_SOFT),
+                                    .color(theme::text_soft()),
                             );
                             ui.add_space(4.0);
                             ui.label(
@@ -2278,7 +2293,7 @@ impl DbBridgeApp {
                                     "Modifica el archivo y pulsa Recalcular."
                                 })
                                 .size(12.0)
-                                .color(theme::SUBTLE),
+                                .color(theme::subtle()),
                             );
                         });
                         return;
@@ -2304,7 +2319,7 @@ impl DbBridgeApp {
     }
 
     fn central_panel(&mut self, ui: &mut egui::Ui) {
-        let frame = Frame::NONE.fill(theme::BG).inner_margin(Margin::same(16));
+        let frame = Frame::NONE.fill(theme::bg()).inner_margin(Margin::same(16));
         egui::CentralPanel::default().frame(frame).show(ui, |ui| {
             if self.db_path.is_none() {
                 self.welcome(ui);
@@ -2336,7 +2351,7 @@ impl DbBridgeApp {
                             ui.label(
                                 theme::strong("Conecta una base de datos")
                                     .size(24.0)
-                                    .color(theme::TEXT),
+                                    .color(theme::text()),
                             );
                             ui.add_space(2.0);
                             ui.label(
@@ -2344,7 +2359,7 @@ impl DbBridgeApp {
                                     "Abre un archivo SQLite local o extrae la base de datos de tu app desde el simulador o el emulador.",
                                 )
                                 .size(14.0)
-                                .color(theme::MUTED),
+                                .color(theme::muted()),
                             );
                             ui.add_space(20.0);
 
@@ -2370,12 +2385,12 @@ impl DbBridgeApp {
                             ui.add_space(16.0);
 
                             let drop_stroke = if hovering_file {
-                                Stroke::new(1.5, theme::ACCENT)
+                                Stroke::new(1.5, theme::accent())
                             } else {
-                                Stroke::new(1.5, theme::BORDER_STRONG)
+                                Stroke::new(1.5, theme::border_strong())
                             };
                             Frame::NONE
-                                .fill(theme::SIDEBAR)
+                                .fill(theme::sidebar())
                                 .stroke(drop_stroke)
                                 .corner_radius(CornerRadius::same(12))
                                 .inner_margin(Margin::same(28))
@@ -2385,7 +2400,7 @@ impl DbBridgeApp {
                                         ui.label(
                                             RichText::new("Arrastra un archivo .db aquí")
                                                 .size(14.5)
-                                                .color(theme::TEXT),
+                                                .color(theme::text()),
                                         );
                                         ui.weak("o");
                                         if ui
@@ -2408,11 +2423,11 @@ impl DbBridgeApp {
                                         SourceMode::Android => "Android",
                                     };
                                     let button = egui::Button::new((
-                                        RichText::new(tag).size(11.5).color(theme::MUTED),
-                                        theme::mono(recent.label()).color(theme::TEXT),
+                                        RichText::new(tag).size(11.5).color(theme::muted()),
+                                        theme::mono(recent.label()).color(theme::text()),
                                     ))
                                     .right_text(
-                                        RichText::new("Reconectar").size(12.0).color(theme::SUBTLE),
+                                        RichText::new("Reconectar").size(12.0).color(theme::subtle()),
                                     )
                                     .min_size(egui::vec2(ui.available_width(), 40.0));
                                     if ui.add(button).clicked() {
@@ -2462,7 +2477,7 @@ impl DbBridgeApp {
                         let run = theme::primary_button("▶  Ejecutar").shortcut_text(
                             RichText::new(shortcut)
                                 .size(11.5)
-                                .color(theme::ON_ACCENT.gamma_multiply(0.7)),
+                                .color(theme::on_accent().gamma_multiply(0.7)),
                         );
                         if ui.add(run).clicked() {
                             self.run_sql();
@@ -2548,7 +2563,7 @@ impl DbBridgeApp {
                             .collect::<Vec<_>>()
                             .join("\n");
                         ui.add(
-                            egui::Label::new(theme::mono(numbers).color(theme::FAINT))
+                            egui::Label::new(theme::mono(numbers).color(theme::faint()))
                                 .selectable(false),
                         );
                         ui.add_space(6.0);
@@ -2602,7 +2617,7 @@ impl DbBridgeApp {
                             .as_ref()
                             .map(|object| object.name.clone())
                             .unwrap_or_else(|| "Consulta".to_string());
-                        ui.label(theme::mono(title).color(theme::TEXT));
+                        ui.label(theme::mono(title).color(theme::text()));
 
                         if self.selected.is_some() {
                             let tabs = [(ResultsTab::Data, "Datos"), (ResultsTab::Schema, "Esquema")];
@@ -2645,17 +2660,17 @@ impl DbBridgeApp {
                                     "{summary} · {} ms",
                                     self.result.elapsed.as_millis()
                                 ))
-                                .color(theme::MUTED),
+                                .color(theme::muted()),
                             );
                             if self.result.is_editable() {
                                 theme::badge(
                                     ui,
                                     "Editable",
-                                    theme::SUCCESS,
-                                    theme::SUCCESS.gamma_multiply(0.14),
+                                    theme::success(),
+                                    theme::success().gamma_multiply(0.14),
                                 );
                             } else {
-                                theme::badge(ui, "Solo lectura", theme::MUTED, theme::RAISED);
+                                theme::badge(ui, "Solo lectura", theme::muted(), theme::raised());
                             }
                         }
 
@@ -2676,7 +2691,7 @@ impl DbBridgeApp {
                                                 "Doble clic edita · Enter guarda · Esc cancela · clic derecho: más opciones",
                                             )
                                             .size(12.0)
-                                            .color(theme::SUBTLE),
+                                            .color(theme::subtle()),
                                         )
                                         .truncate(),
                                     );
@@ -2749,14 +2764,14 @@ impl DbBridgeApp {
             Err(error) => {
                 ui.label(
                     RichText::new(format!("No se pudo leer el esquema: {error}"))
-                        .color(theme::DANGER),
+                        .color(theme::danger()),
                 );
             }
         }
     }
 
     fn live_watch_selector(&mut self, ui: &mut egui::Ui) {
-        ui.label(RichText::new("Live Watch").size(12.0).color(theme::MUTED))
+        ui.label(RichText::new("Live Watch").size(12.0).color(theme::muted()))
             .on_hover_text(if self.target.is_some() {
                 "Vuelve a extraer la base de datos del dispositivo y a ejecutar la consulta \
                  cada cierto tiempo. Se pausa mientras editas o hay cambios sin push."
@@ -2789,7 +2804,7 @@ impl DbBridgeApp {
         ui.label(
             RichText::new(format!("Página {} de {}", page + 1, last_page + 1))
                 .size(12.0)
-                .color(theme::MUTED),
+                .color(theme::muted()),
         );
         nav(ui, "‹", page > 0, page.saturating_sub(1), "Página anterior");
         nav(ui, "«", page > 0, 0, "Primera página");
@@ -2807,7 +2822,7 @@ impl DbBridgeApp {
                 ui.label(
                     RichText::new("Sin resultados")
                         .family(theme::semibold())
-                        .color(theme::TEXT_SOFT),
+                        .color(theme::text_soft()),
                 );
                 ui.add_space(4.0);
                 ui.weak("Ejecuta una consulta o selecciona una tabla.");
@@ -2834,7 +2849,7 @@ impl DbBridgeApp {
                     .min_row_height(26.0)
                     .spacing(egui::vec2(20.0, 4.0))
                     .show(ui, |ui| {
-                        ui.label(theme::mono("#").color(theme::FAINT));
+                        ui.label(theme::mono("#").color(theme::faint()));
                         for column in &self.result.columns {
                             let arrow = match &self.view.sort {
                                 Some((sorted, false)) if sorted == column && sortable => " ▲",
@@ -2842,9 +2857,9 @@ impl DbBridgeApp {
                                 _ => "",
                             };
                             let color = if arrow.is_empty() {
-                                theme::MUTED
+                                theme::muted()
                             } else {
-                                theme::ACCENT
+                                theme::accent()
                             };
                             let text = theme::strong(format!("{column}{arrow}"))
                                 .size(12.5)
@@ -2864,7 +2879,9 @@ impl DbBridgeApp {
                         ui.end_row();
 
                         for (row_index, row) in self.result.rows.iter().enumerate() {
-                            ui.label(theme::mono((row_index + 1).to_string()).color(theme::FAINT));
+                            ui.label(
+                                theme::mono((row_index + 1).to_string()).color(theme::faint()),
+                            );
 
                             for (column_index, value) in row.iter().enumerate() {
                                 let is_editing = self
@@ -2885,8 +2902,8 @@ impl DbBridgeApp {
                                             .font(egui::TextStyle::Monospace)
                                             .frame(
                                                 Frame::NONE
-                                                    .fill(theme::BG)
-                                                    .stroke(Stroke::new(1.0, theme::ACCENT))
+                                                    .fill(theme::bg())
+                                                    .stroke(Stroke::new(1.0, theme::accent()))
                                                     .corner_radius(CornerRadius::same(4))
                                                     .inner_margin(Margin::symmetric(6, 3)),
                                             ),
@@ -2917,7 +2934,7 @@ impl DbBridgeApp {
                                     };
                                     let text = match &preview {
                                         Some(preview) => {
-                                            theme::mono(preview.as_str()).color(theme::TEXT)
+                                            theme::mono(preview.as_str()).color(theme::text())
                                         }
                                         None => cell_text(value),
                                     };
@@ -2966,7 +2983,8 @@ impl DbBridgeApp {
                                                 ui.close();
                                             }
                                             let delete = egui::Button::new(
-                                                RichText::new("Eliminar fila").color(theme::DANGER),
+                                                RichText::new("Eliminar fila")
+                                                    .color(theme::danger()),
                                             );
                                             if ui.add(delete).clicked() {
                                                 action = Some(CellAction::Delete(cell.0));
@@ -3001,9 +3019,9 @@ impl DbBridgeApp {
 /// Tarjeta clicable de origen para la pantalla de bienvenida.
 fn source_card(ui: &mut egui::Ui, mode: SourceMode, description: &str, active: bool) -> bool {
     let stroke = if active {
-        Stroke::new(1.0, theme::ACCENT)
+        Stroke::new(1.0, theme::accent())
     } else {
-        Stroke::new(1.0, theme::BORDER)
+        Stroke::new(1.0, theme::border())
     };
     let frame = theme::card()
         .stroke(stroke)
@@ -3012,9 +3030,9 @@ fn source_card(ui: &mut egui::Ui, mode: SourceMode, description: &str, active: b
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.set_min_height(64.0);
-            ui.label(theme::strong(mode.label()).size(14.0).color(theme::TEXT));
+            ui.label(theme::strong(mode.label()).size(14.0).color(theme::text()));
             ui.add_space(2.0);
-            ui.label(RichText::new(description).size(12.5).color(theme::MUTED));
+            ui.label(RichText::new(description).size(12.5).color(theme::muted()));
         });
     let rect = frame.response.rect;
     let response = ui
@@ -3024,7 +3042,7 @@ fn source_card(ui: &mut egui::Ui, mode: SourceMode, description: &str, active: b
         ui.painter().rect_stroke(
             rect,
             CornerRadius::same(12),
-            Stroke::new(1.0, Color32::from_rgb(0x46, 0x4D, 0x5B)),
+            Stroke::new(1.0, theme::border_hover()),
             egui::StrokeKind::Inside,
         );
     }
@@ -3049,18 +3067,20 @@ fn schema_view(ui: &mut egui::Ui, schema: &db::TableSchema) {
                             0 => RichText::new(""),
                             position => RichText::new(format!("PK{position}"))
                                 .size(11.0)
-                                .color(theme::WARNING),
+                                .color(theme::warning()),
                         },
-                        theme::mono(column.name.as_str()).color(theme::TEXT),
-                        theme::mono(column.decl_type.as_str()).color(theme::KEYWORD),
+                        theme::mono(column.name.as_str()).color(theme::text()),
+                        theme::mono(column.decl_type.as_str()).color(theme::keyword()),
                         if column.not_null {
-                            RichText::new("NOT NULL").size(12.0).color(theme::TEXT_SOFT)
+                            RichText::new("NOT NULL")
+                                .size(12.0)
+                                .color(theme::text_soft())
                         } else {
-                            RichText::new("sí").size(12.0).color(theme::SUBTLE)
+                            RichText::new("sí").size(12.0).color(theme::subtle())
                         },
                         match &column.default {
-                            Some(default) => theme::mono(default.as_str()).color(theme::STRING),
-                            None => RichText::new("—").color(theme::FAINT),
+                            Some(default) => theme::mono(default.as_str()).color(theme::string()),
+                            None => RichText::new("—").color(theme::faint()),
                         },
                     ]
                 }),
@@ -3084,9 +3104,9 @@ fn schema_view(ui: &mut egui::Ui, schema: &db::TableSchema) {
                             kind.push_str(" · parcial");
                         }
                         vec![
-                            theme::mono(index.name.as_str()).color(theme::TEXT),
-                            theme::mono(index.columns.join(", ")).color(theme::IDENT),
-                            RichText::new(kind).size(12.0).color(theme::MUTED),
+                            theme::mono(index.name.as_str()).color(theme::text()),
+                            theme::mono(index.columns.join(", ")).color(theme::ident()),
+                            RichText::new(kind).size(12.0).color(theme::muted()),
                         ]
                     }),
                 );
@@ -3100,15 +3120,15 @@ fn schema_view(ui: &mut egui::Ui, schema: &db::TableSchema) {
                     &["Columnas", "Referencia", "ON UPDATE", "ON DELETE"],
                     schema.foreign_keys.iter().map(|key| {
                         vec![
-                            theme::mono(key.from.join(", ")).color(theme::TEXT),
+                            theme::mono(key.from.join(", ")).color(theme::text()),
                             theme::mono(format!("{}({})", key.table, key.to.join(", ")))
-                                .color(theme::IDENT),
+                                .color(theme::ident()),
                             RichText::new(key.on_update.as_str())
                                 .size(12.0)
-                                .color(theme::MUTED),
+                                .color(theme::muted()),
                             RichText::new(key.on_delete.as_str())
                                 .size(12.0)
-                                .color(theme::MUTED),
+                                .color(theme::muted()),
                         ]
                     }),
                 );
@@ -3152,7 +3172,7 @@ fn schema_section(ui: &mut egui::Ui, title: &str, count: usize) {
 
 fn schema_section_text(ui: &mut egui::Ui, title: &str) {
     ui.add_space(6.0);
-    ui.label(RichText::new(title).color(theme::TEXT_SOFT));
+    ui.label(RichText::new(title).color(theme::text_soft()));
 }
 
 fn schema_grid(
@@ -3170,7 +3190,7 @@ fn schema_grid(
                     RichText::new(*header)
                         .family(theme::semibold())
                         .size(12.0)
-                        .color(theme::MUTED),
+                        .color(theme::muted()),
                 );
             }
             ui.end_row();
@@ -3186,9 +3206,9 @@ fn schema_grid(
 /// `+n −n ~n` con los colores de cada tipo de cambio; omite los que son cero.
 fn change_counts(ui: &mut egui::Ui, inserted: u64, deleted: u64, updated: u64) {
     for (count, sign, color) in [
-        (inserted, "+", theme::SUCCESS),
-        (deleted, "−", theme::DANGER),
-        (updated, "~", theme::WARNING),
+        (inserted, "+", theme::success()),
+        (deleted, "−", theme::danger()),
+        (updated, "~", theme::warning()),
     ] {
         if count > 0 {
             ui.label(theme::mono(format!("{sign}{count}")).color(color));
@@ -3202,20 +3222,20 @@ fn table_diff(ui: &mut egui::Ui, table: &TableDiff) {
     let id = ui.make_persistent_id(("diff_table", table.name.as_str()));
     egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, true)
         .show_header(ui, |ui| {
-            ui.label(theme::mono(table.name.as_str()).color(theme::TEXT));
+            ui.label(theme::mono(table.name.as_str()).color(theme::text()));
             match table.change {
                 TableChange::Added => {
-                    let bg = theme::SUCCESS.gamma_multiply(0.14);
-                    theme::badge(ui, "nueva", theme::SUCCESS, bg);
+                    let bg = theme::success().gamma_multiply(0.14);
+                    theme::badge(ui, "nueva", theme::success(), bg);
                 }
                 TableChange::Removed => {
-                    let bg = theme::DANGER.gamma_multiply(0.14);
-                    theme::badge(ui, "eliminada", theme::DANGER, bg);
+                    let bg = theme::danger().gamma_multiply(0.14);
+                    theme::badge(ui, "eliminada", theme::danger(), bg);
                 }
                 TableChange::Modified => {}
             }
             if table.schema_changed {
-                theme::badge(ui, "esquema cambiado", theme::WARNING, theme::RAISED)
+                theme::badge(ui, "esquema cambiado", theme::warning(), theme::raised())
                     .on_hover_text("Solo se comparan las columnas que existen en ambas versiones.");
             }
             change_counts(
@@ -3228,17 +3248,17 @@ fn table_diff(ui: &mut egui::Ui, table: &TableDiff) {
         .body(|ui| {
             ui.spacing_mut().item_spacing.y = 4.0;
             if table.inserted.count > 0 {
-                diff_section(ui, "Insertadas", theme::SUCCESS, table.inserted.count);
+                diff_section(ui, "Insertadas", theme::success(), table.inserted.count);
                 let rows = table.inserted.rows.iter().map(|row| (row.as_slice(), None));
                 diff_grid(ui, (&table.name, "ins"), &table.columns, rows);
             }
             if table.deleted.count > 0 {
-                diff_section(ui, "Eliminadas", theme::DANGER, table.deleted.count);
+                diff_section(ui, "Eliminadas", theme::danger(), table.deleted.count);
                 let rows = table.deleted.rows.iter().map(|row| (row.as_slice(), None));
                 diff_grid(ui, (&table.name, "del"), &table.columns, rows);
             }
             if table.updated.count > 0 {
-                diff_section(ui, "Modificadas", theme::WARNING, table.updated.count);
+                diff_section(ui, "Modificadas", theme::warning(), table.updated.count);
                 let rows = table
                     .updated
                     .rows
@@ -3253,12 +3273,12 @@ fn diff_section(ui: &mut egui::Ui, title: &str, color: Color32, count: u64) {
     ui.add_space(4.0);
     ui.horizontal(|ui| {
         theme::dot(ui, color, 3.5);
-        ui.label(RichText::new(format!("{title} · {count}")).color(theme::TEXT_SOFT));
+        ui.label(RichText::new(format!("{title} · {count}")).color(theme::text_soft()));
         if count > diff::MAX_ROWS as u64 {
             ui.label(
                 RichText::new(format!("se muestran las primeras {}", diff::MAX_ROWS))
                     .size(12.0)
-                    .color(theme::SUBTLE),
+                    .color(theme::subtle()),
             );
         }
     });
@@ -3284,7 +3304,7 @@ fn diff_grid<'a>(
                             RichText::new(column.as_str())
                                 .family(theme::semibold())
                                 .size(12.0)
-                                .color(theme::MUTED),
+                                .color(theme::muted()),
                         );
                     }
                     ui.end_row();
@@ -3298,12 +3318,12 @@ fn diff_grid<'a>(
                                             db::value_display(old),
                                             db::value_display(value)
                                         ))
-                                        .color(theme::WARNING),
+                                        .color(theme::warning()),
                                     );
                                 }
                                 Some(_) => {
                                     ui.label(
-                                        theme::mono(db::value_display(value)).color(theme::FAINT),
+                                        theme::mono(db::value_display(value)).color(theme::faint()),
                                     );
                                 }
                                 None => {
@@ -3349,19 +3369,20 @@ fn cell_text(value: &Value) -> RichText {
         Value::Null => RichText::new(" NULL ")
             .monospace()
             .italics()
-            .color(theme::SUBTLE)
-            .background_color(theme::HOVER),
+            .color(theme::subtle())
+            .background_color(theme::hover()),
         Value::Integer(_) | Value::Real(_) => {
-            theme::mono(db::value_display(value)).color(theme::NUMBER)
+            theme::mono(db::value_display(value)).color(theme::number())
         }
-        Value::Blob(_) => theme::mono(db::value_display(value)).color(theme::MUTED),
-        Value::Text(_) => theme::mono(db::value_display(value)).color(theme::TEXT),
+        Value::Blob(_) => theme::mono(db::value_display(value)).color(theme::muted()),
+        Value::Text(_) => theme::mono(db::value_display(value)).color(theme::text()),
     }
 }
 
 impl eframe::App for DbBridgeApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        theme::sync(&ctx);
         self.poll_tasks();
         self.handle_dropped_files(&ctx);
         self.tick_live_watch(&ctx);

@@ -33,6 +33,7 @@ Construido en Rust con `eframe`/`egui` (UI nativa, sin WebView) y `rusqlite` (SQ
 - Consultas favoritas persistentes entre sesiones.
 - Soporte de WAL: copia `-wal` y `-shm`, y hace checkpoint antes de cada push.
 - Detección, extracción y push en segundo plano: la ventana sigue respondiendo mientras trabajan `adb` o `simctl`, con un indicador en la barra de estado.
+- Tema claro, oscuro o automático (sigue al sistema).
 - Actualizaciones: una banda en la parte superior avisa de la versión nueva y permite instalarla desde la app (**Actualizar** → **Reiniciar ahora**), abrir la página de descarga o las notas de la Release, u omitir esa versión. Se desactiva desde el número de versión de la barra de estado.
 
 ## Descarga
@@ -128,7 +129,7 @@ src/
 
 Decisiones relevantes:
 
-- La interfaz usa un tema oscuro propio (`theme.rs`). No se distribuye ninguna fuente: se cargan en tiempo de ejecución las del sistema (SF Pro/SF Mono en macOS, Segoe UI/Cascadia Mono o Consolas en Windows, Noto o DejaVu en Linux) y, si no existen, las que trae egui.
+- La interfaz tiene un tema claro y otro oscuro propios (`theme.rs`), elegibles con el selector **Auto · Claro · Oscuro** de la barra superior; *Auto* sigue el tema del sistema. Los colores se piden a la paleta activa en cada frame (`theme::text()`, `theme::accent()`…), así que el cambio es inmediato. No se distribuye ninguna fuente: se cargan en tiempo de ejecución las del sistema (SF Pro/SF Mono en macOS, Segoe UI/Cascadia Mono o Consolas en Windows, Noto o DejaVu en Linux) y, si no existen, las que trae egui.
 
 - Los nombres de tabla y columna se interpolan siempre con `quote_ident`, que duplica comillas dobles.
 - Las tablas normales se editan por `rowid`; las `WITHOUT ROWID` con clave primaria simple usan esa columna como clave. Vistas y claves compuestas quedan en solo lectura.
