@@ -9,22 +9,42 @@ on:
   push:
     branches: [main]
 
-permissions:
-  contents: write
-  pull-requests: write
+# Sin permisos por defecto: cada job pide solo lo que necesita.
+permissions: {}
+
+# Nunca dos publicaciones a la vez; la que está en marcha no se cancela.
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 jobs:
   release-please:
     name: Versión
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    timeout-minutes: 10
     outputs:
       created: ${{ steps.release.outputs.release_created }}
       tag: ${{ steps.release.outputs.tag_name }}
       version: ${{ steps.release.outputs.version }}
     steps:
-      - uses: googleapis/release-please-action@v4
+      # Con la GitHub App de releases (docs/github.md) la PR de versión la abre la App: el CI se
+      # ejecuta sobre ella y puedes aprobarla tú. Sin la App se usa el token del workflow, que
+      # no dispara el CI en la PR.
+      - name: Token de la GitHub App de releases
+        id: app-token
+        if: vars.RELEASE_APP_CLIENT_ID != ''
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         id: release
         with:
+          token: ${{ steps.app-token.outputs.token || github.token }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
 
@@ -38,19 +58,28 @@ jobs:
         include:
           - platform: macos
             os: macos-latest
+            asset: DB-Bridge-macOS-universal.dmg
           - platform: linux
             os: ubuntu-22.04
+            asset: db-bridge-linux-x86_64.tar.gz
           - platform: windows
             os: windows-latest
+            asset: db-bridge-windows-x86_64.zip
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write # subir los binarios a la Release
+      id-token: write # firmar la atestación de procedencia (Sigstore)
+      attestations: write
+    timeout-minutes: 45
     env:
       TAG: ${{ needs.release-please.outputs.tag }}
       VERSION: ${{ needs.release-please.outputs.version }}
       GH_TOKEN: ${{ github.token }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.release-please.outputs.tag }}
+          persist-credentials: false
 
       - name: Dependencias de sistema (Linux)
         if: runner.os == 'Linux'
@@ -59,7 +88,7 @@ jobs:
           sudo apt-get install -y pkg-config libxkbcommon-dev libwayland-dev \
             libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libgl1-mesa-dev
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: release-${{ matrix.platform }}
 
@@ -127,6 +156,13 @@ jobs:
           $hash = (Get-FileHash dist/db-bridge-windows-x86_64.zip -Algorithm SHA256).Hash.ToLower()
           "$hash  db-bridge-windows-x86_64.zip" | Out-File -Encoding ascii dist/db-bridge-windows-x86_64.zip.sha256
 
+      # Atestación firmada de que cada archivo salió de este workflow y de este commit.
+      # Se verifica con: gh attestation verify <archivo> --repo gt2rz/db-bridge
+      - name: Atestación de procedencia
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/${{ matrix.asset }}
+
       - name: Subir a la Release
         shell: bash
         run: |
@@ -138,6 +174,8 @@ jobs:
     needs: [release-please, build]
     if: needs.release-please.outputs.created == 'true'
     runs-on: ubuntu-latest
+    permissions: {}
+    timeout-minutes: 5
     env:
       # Token opcional (fine-grained, permiso Contents: write sobre gt2rz/db-bridge-landing).
       # Sin él, la landing recoge la versión nueva en su compilación diaria.

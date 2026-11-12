@@ -1,0 +1,21 @@
+# cargo-deny: auditoría de dependencias que ejecuta el CI (`cargo deny check advisories bans sources`).
+
+[advisories]
+# Vulnerabilidades y crates retirados según la base de datos RustSec. Para aceptar un aviso
+# concreto, añádelo con su motivo: { id = "RUSTSEC-AAAA-NNNN", reason = "…" }.
+yanked = "deny"
+# Las vulnerabilidades fallan en cualquier crate del árbol; "sin mantenimiento" solo en las
+# dependencias directas, que son las que se pueden cambiar (egui y rfd arrastran varias).
+unmaintained = "workspace"
+ignore = []
+
+[bans]
+# El árbol de egui arrastra varias versiones de algunos crates: no es un riesgo de seguridad.
+multiple-versions = "allow"
+wildcards = "deny"
+
+[sources]
+# Solo crates.io: nada de registros alternativos ni dependencias desde repositorios git.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

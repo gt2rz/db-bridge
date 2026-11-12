@@ -1,0 +1,37 @@
+name: Error
+description: Algo no funciona como debería.
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: Qué pasa
+      description: Qué hiciste, qué esperabas y qué ocurrió. Incluye el mensaje de la barra de estado si lo hay.
+    validations:
+      required: true
+  - type: dropdown
+    id: source
+    attributes:
+      label: Origen de la base de datos
+      options: [Archivo local, Simulador iOS, Emulador o dispositivo Android]
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Versión de DB Bridge
+      placeholder: 0.0.1
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Sistema operativo
+      placeholder: macOS 15.3 (Apple Silicon)
+    validations:
+      required: true
+  - type: textarea
+    id: extra
+    attributes:
+      label: Más contexto
+      description: Framework de la app (Flutter, Room, SwiftData…), modo WAL, capturas… No pegues datos sensibles de tu base de datos.

@@ -38,6 +38,8 @@ Construido en Rust con `eframe`/`egui` (UI nativa, sin WebView) y `rusqlite` (SQ
 
 Binarios para macOS (universal), Windows y Linux en la [página de descarga](https://gt2rz.github.io/db-bridge-landing/) o en [GitHub Releases](https://github.com/gt2rz/db-bridge/releases). La app de macOS no está firmada por Apple: la primera vez ábrela con clic derecho → Abrir.
 
+Cada binario lleva una atestación de procedencia firmada y un `.sha256`: `gh attestation verify <archivo> --repo gt2rz/db-bridge`. Más detalles y cómo reportar vulnerabilidades en [SECURITY.md](SECURITY.md).
+
 ## Requisitos
 
 - Rust estable ≥ 1.95 (`rustup` lo instala con el `rust-toolchain.toml` del repo).
@@ -90,7 +92,7 @@ Con un archivo local los cambios se escriben directamente en el archivo. Con un 
 
 ## Versiones y publicación
 
-- `.github/workflows/ci.yml`: formato, clippy y tests en Linux, macOS y Windows en cada push y PR.
+- `.github/workflows/ci.yml`: formato, clippy y tests en Linux, macOS y Windows, y auditoría de dependencias con `cargo-deny` (`deny.toml`), en cada push y PR.
 - `.github/workflows/release.yml`: [release-please](https://github.com/googleapis/release-please) mantiene una PR de versión a partir de los commits convencionales (`feat:`, `fix:`…). Al fusionarla actualiza `Cargo.toml`, `Cargo.lock` y `CHANGELOG.md`, crea la etiqueta `vX.Y.Z` y la Release, y compila y adjunta:
   - `DB-Bridge-macOS-universal.dmg` (Apple Silicon + Intel, firma ad hoc),
   - `db-bridge-windows-x86_64.zip`,
@@ -98,6 +100,7 @@ Con un archivo local los cambios se escriben directamente en el archivo. Con un 
   - y un `.sha256` de cada uno.
 - Mientras la versión sea `0.x`, `feat:` sube el parche (0.0.1 → 0.0.2) y un cambio incompatible (`feat!:`) sube la menor.
 - Los nombres de los archivos no llevan versión: la landing enlaza a `releases/latest/download/<archivo>`. Si se cambian, hay que cambiarlos también en `src/config.ts` de la landing.
+- Los workflows no tienen permisos por defecto (cada job pide los suyos), usan actions fijadas por SHA y los binarios se publican con atestación de procedencia. La protección de `main`, las etiquetas y los ajustes de seguridad del repo están en [docs/github.md](docs/github.md).
 - Secreto opcional `LANDING_DISPATCH_TOKEN` (token fine-grained con permiso *Contents: write* sobre `gt2rz/db-bridge-landing`): al publicar una Release, la landing se recompila al momento. Sin él, la landing se actualiza en su compilación diaria.
 
 ## Arquitectura

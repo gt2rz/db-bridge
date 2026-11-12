@@ -1,0 +1,29 @@
+# Actualizaciones semanales de dependencias. Cada PR necesita tu aprobación (ruleset de main).
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: chore
+      include: scope
+    groups:
+      # egui/eframe se actualizan juntos o no compilan.
+      egui:
+        patterns: ["egui*", "eframe", "epaint*", "emath", "ecolor"]
+      menores:
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: ci
+    groups:
+      actions:
+        patterns: ["*"]

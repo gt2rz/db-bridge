@@ -5,23 +5,32 @@ on:
     branches: [main]
   pull_request:
 
-permissions:
-  contents: read
+# Sin permisos por defecto: cada job pide solo lo que necesita.
+permissions: {}
 
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# Las actions van fijadas por SHA (con su versión en el comentario) para que una etiqueta
+# reescrita no pueda cambiar el código que se ejecuta. Dependabot las mantiene al día.
+
 jobs:
   check:
+    # Los nombres de estos jobs son los checks obligatorios de .github/rulesets/main.json.
     name: Comprobar (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-22.04, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       # rust-toolchain.toml fija el canal estable con rustfmt y clippy; rustup lo instala solo.
       - name: Dependencias de sistema (Linux)
@@ -31,7 +40,7 @@ jobs:
           sudo apt-get install -y pkg-config libxkbcommon-dev libwayland-dev \
             libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libgl1-mesa-dev
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Formato
         run: cargo fmt --check
@@ -41,3 +50,19 @@ jobs:
 
       - name: Tests
         run: cargo test --locked
+
+  audit:
+    name: Auditoría de dependencias
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Vulnerabilidades (RustSec), crates retirados y orígenes permitidos: ver deny.toml.
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check advisories bans sources
