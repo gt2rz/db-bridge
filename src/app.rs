@@ -23,6 +23,12 @@ struct CellEdit {
     focus_pending: bool,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum ResultsTab {
+    Data,
+    Schema,
+}
+
 /// Copia fijada de la BD conectada con la que se comparan los cambios posteriores.
 struct Baseline {
     /// BD de la que se tomó: al conectar otra, la línea base deja de valer.
@@ -92,6 +98,9 @@ pub struct DbBridgeApp {
     /// Página de la tabla seleccionada (de `db::ROW_LIMIT` filas) mientras se explora.
     page: usize,
     result: QueryResult,
+    results_tab: ResultsTab,
+    /// Esquema de la tabla seleccionada, cargado al abrir la pestaña y guardado con su nombre.
+    schema: Option<(String, Result<db::TableSchema, String>)>,
     editing: Option<CellEdit>,
     live_watch: bool,
     last_refresh: Instant,
@@ -128,6 +137,8 @@ impl DbBridgeApp {
             generated_sql: None,
             page: 0,
             result: QueryResult::default(),
+            results_tab: ResultsTab::Data,
+            schema: None,
             editing: None,
             live_watch: false,
             last_refresh: Instant::now(),
@@ -562,6 +573,8 @@ impl DbBridgeApp {
     /// Registra un cambio ya aplicado en la copia local. Con un archivo local el cambio ya está
     /// en el origen; con un dispositivo se envía al momento si el push automático está activo.
     fn record_change(&mut self, message: String) {
+        // Puede ser DDL (ALTER, CREATE INDEX…): el esquema se vuelve a leer al mostrarlo.
+        self.schema = None;
         if self.target.is_none() || self.db_path.is_none() {
             self.status = message;
             return;
@@ -596,6 +609,7 @@ impl DbBridgeApp {
         self.objects = objects;
         self.editing = None;
         self.dirty = false;
+        self.schema = None;
         // Un push en cola era para la copia anterior.
         self.queued_push = None;
         if self.sql.trim().is_empty() {
@@ -1782,6 +1796,16 @@ impl DbBridgeApp {
                             .unwrap_or_else(|| "Consulta".to_string());
                         ui.label(theme::mono(title).color(theme::TEXT));
 
+                        if self.selected.is_some() {
+                            let tabs = [(ResultsTab::Data, "Datos"), (ResultsTab::Schema, "Esquema")];
+                            if theme::segmented(ui, &mut self.results_tab, &tabs) {
+                                self.editing = None;
+                            }
+                        }
+                        if self.results_tab == ResultsTab::Schema && self.selected.is_some() {
+                            return;
+                        }
+
                         if !self.result.columns.is_empty() {
                             let rows = self.result.rows.len();
                             let summary = match self.result.total {
@@ -1843,8 +1867,49 @@ impl DbBridgeApp {
 
             Frame::NONE
                 .inner_margin(Margin::symmetric(14, 8))
-                .show(ui, |ui| self.render_results(ui));
+                .show(ui, |ui| {
+                    if self.results_tab == ResultsTab::Schema && self.selected.is_some() {
+                        self.render_schema(ui);
+                    } else {
+                        self.render_results(ui);
+                    }
+                });
         });
+    }
+
+    fn render_schema(&mut self, ui: &mut egui::Ui) {
+        let Some(name) = self.selected.as_ref().map(|object| object.name.clone()) else {
+            return;
+        };
+        if self.tasks.is_running(TaskKind::Pull) {
+            ui.weak("Extrayendo la base de datos…");
+            return;
+        }
+        if self
+            .schema
+            .as_ref()
+            .is_none_or(|(loaded, _)| *loaded != name)
+        {
+            let schema = match &self.db_path {
+                Some(path) => db::open(path)
+                    .and_then(|conn| db::table_schema(&conn, &name))
+                    .map_err(|error| format!("{error:#}")),
+                None => return,
+            };
+            self.schema = Some((name, schema));
+        }
+        let Some((_, schema)) = &self.schema else {
+            return;
+        };
+        match schema {
+            Ok(schema) => schema_view(ui, schema),
+            Err(error) => {
+                ui.label(
+                    RichText::new(format!("No se pudo leer el esquema: {error}"))
+                        .color(theme::DANGER),
+                );
+            }
+        }
     }
 
     /// Controles de página, de derecha a izquierda: » › «Página n de m» ‹ «.
@@ -2031,6 +2096,158 @@ fn source_card(ui: &mut egui::Ui, mode: SourceMode, description: &str, active: b
         );
     }
     response.clicked()
+}
+
+fn schema_view(ui: &mut egui::Ui, schema: &db::TableSchema) {
+    egui::ScrollArea::vertical()
+        .id_salt("schema_scroll")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 4.0;
+
+            schema_section(ui, "Columnas", schema.columns.len());
+            schema_grid(
+                ui,
+                "schema_columns",
+                &["", "Nombre", "Tipo", "Nulos", "Por defecto"],
+                schema.columns.iter().map(|column| {
+                    vec![
+                        match column.primary_key {
+                            0 => RichText::new(""),
+                            position => RichText::new(format!("PK{position}"))
+                                .size(11.0)
+                                .color(theme::WARNING),
+                        },
+                        theme::mono(column.name.as_str()).color(theme::TEXT),
+                        theme::mono(column.decl_type.as_str()).color(theme::KEYWORD),
+                        if column.not_null {
+                            RichText::new("NOT NULL").size(12.0).color(theme::TEXT_SOFT)
+                        } else {
+                            RichText::new("sí").size(12.0).color(theme::SUBTLE)
+                        },
+                        match &column.default {
+                            Some(default) => theme::mono(default.as_str()).color(theme::STRING),
+                            None => RichText::new("—").color(theme::FAINT),
+                        },
+                    ]
+                }),
+            );
+
+            if !schema.indexes.is_empty() {
+                schema_section(ui, "Índices", schema.indexes.len());
+                schema_grid(
+                    ui,
+                    "schema_indexes",
+                    &["Nombre", "Columnas", "Tipo"],
+                    schema.indexes.iter().map(|index| {
+                        let mut kind = match index.origin.as_str() {
+                            "pk" => "clave primaria",
+                            "u" => "restricción UNIQUE",
+                            _ if index.unique => "UNIQUE",
+                            _ => "índice",
+                        }
+                        .to_string();
+                        if index.partial {
+                            kind.push_str(" · parcial");
+                        }
+                        vec![
+                            theme::mono(index.name.as_str()).color(theme::TEXT),
+                            theme::mono(index.columns.join(", ")).color(theme::IDENT),
+                            RichText::new(kind).size(12.0).color(theme::MUTED),
+                        ]
+                    }),
+                );
+            }
+
+            if !schema.foreign_keys.is_empty() {
+                schema_section(ui, "Claves foráneas", schema.foreign_keys.len());
+                schema_grid(
+                    ui,
+                    "schema_foreign_keys",
+                    &["Columnas", "Referencia", "ON UPDATE", "ON DELETE"],
+                    schema.foreign_keys.iter().map(|key| {
+                        vec![
+                            theme::mono(key.from.join(", ")).color(theme::TEXT),
+                            theme::mono(format!("{}({})", key.table, key.to.join(", ")))
+                                .color(theme::IDENT),
+                            RichText::new(key.on_update.as_str())
+                                .size(12.0)
+                                .color(theme::MUTED),
+                            RichText::new(key.on_delete.as_str())
+                                .size(12.0)
+                                .color(theme::MUTED),
+                        ]
+                    }),
+                );
+            }
+
+            // Sentencias originales: la tabla o vista, los índices creados a mano y los triggers.
+            let statements: Vec<&str> = schema
+                .sql
+                .iter()
+                .map(String::as_str)
+                .chain(
+                    schema
+                        .indexes
+                        .iter()
+                        .filter_map(|index| index.sql.as_deref()),
+                )
+                .chain(schema.triggers.iter().map(|(_, sql)| sql.as_str()))
+                .collect();
+            if !statements.is_empty() {
+                let triggers = if schema.triggers.is_empty() {
+                    String::new()
+                } else {
+                    format!(" · {} triggers", schema.triggers.len())
+                };
+                schema_section_text(ui, &format!("SQL{triggers}"));
+                let font_id = egui::TextStyle::Monospace.resolve(ui.style());
+                for sql in statements {
+                    theme::card().inner_margin(Margin::same(10)).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        let job = sql_highlight::layout_job(&format!("{sql};"), font_id.clone());
+                        ui.add(egui::Label::new(job).selectable(true));
+                    });
+                }
+            }
+        });
+}
+
+fn schema_section(ui: &mut egui::Ui, title: &str, count: usize) {
+    schema_section_text(ui, &format!("{title} · {count}"));
+}
+
+fn schema_section_text(ui: &mut egui::Ui, title: &str) {
+    ui.add_space(6.0);
+    ui.label(RichText::new(title).color(theme::TEXT_SOFT));
+}
+
+fn schema_grid(
+    ui: &mut egui::Ui,
+    id: &str,
+    headers: &[&str],
+    rows: impl Iterator<Item = Vec<RichText>>,
+) {
+    egui::Grid::new(id)
+        .striped(true)
+        .spacing(egui::vec2(18.0, 4.0))
+        .show(ui, |ui| {
+            for header in headers {
+                ui.label(
+                    RichText::new(*header)
+                        .family(theme::semibold())
+                        .size(12.0)
+                        .color(theme::MUTED),
+                );
+            }
+            ui.end_row();
+            for row in rows {
+                for cell in row {
+                    ui.label(cell);
+                }
+                ui.end_row();
+            }
+        });
 }
 
 /// `+n −n ~n` con los colores de cada tipo de cambio; omite los que son cero.

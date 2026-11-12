@@ -13,6 +13,7 @@ Construido en Rust con `eframe`/`egui` (UI nativa, sin WebView) y `rusqlite` (SQ
 - Detección automática de apps instaladas (filtra las apps de sistema) y de las bases de datos dentro de cada app.
 - Tamaño en disco de la BD conectada (y de su `-wal`, si lo hay) en la tarjeta de conexión.
 - Navegación de tablas y vistas con indicador de solo lectura.
+- Pestaña **Esquema** de cada tabla o vista: columnas (tipo, `NOT NULL`, valor por defecto, posición en la PK), índices (incluidos los automáticos de `UNIQUE`/PK, parciales y de expresión), claves foráneas con sus acciones, triggers y las sentencias `CREATE` originales con resaltado.
 - Paginación de tablas y vistas en páginas de 200 filas, con el total de filas y controles de primera/anterior/siguiente/última. La página se conserva al refrescar y se ajusta si la tabla encoge.
 - Pantalla de bienvenida con selección de origen y conexiones recientes.
 - Editor SQL multilínea con resaltado de sintaxis, números de línea y `Ctrl/Cmd + Enter`.
@@ -154,7 +155,7 @@ Las pruebas cubren listado de tablas/vistas, consultas editables, `WITHOUT ROWID
 
 ## Limitaciones conocidas
 
-- No hay edición de esquema (DDL asistido) ni migraciones.
+- El esquema se puede consultar pero no editar (sin DDL asistido ni migraciones).
 - El editor ejecuta una sentencia por vez.
 - Los BLOB se muestran y exportan como `<BLOB n bytes>`.
 - Las tablas con clave primaria compuesta son de solo lectura.

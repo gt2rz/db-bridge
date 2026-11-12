@@ -143,6 +143,144 @@ fn key_expression(conn: &Connection, object: &DbObject) -> Result<Option<String>
     })
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct ColumnInfo {
+    pub name: String,
+    pub decl_type: String,
+    pub not_null: bool,
+    pub default: Option<String>,
+    /// Posición en la clave primaria (1, 2…) o 0 si no forma parte de ella.
+    pub primary_key: i64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct IndexInfo {
+    pub name: String,
+    pub unique: bool,
+    /// `c` creado con CREATE INDEX, `u` por una restricción UNIQUE, `pk` por la clave primaria.
+    pub origin: String,
+    pub partial: bool,
+    /// Columnas indexadas; las expresiones aparecen como `<expresión>`.
+    pub columns: Vec<String>,
+    pub sql: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ForeignKey {
+    pub from: Vec<String>,
+    pub table: String,
+    pub to: Vec<String>,
+    pub on_update: String,
+    pub on_delete: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TableSchema {
+    pub columns: Vec<ColumnInfo>,
+    pub indexes: Vec<IndexInfo>,
+    pub foreign_keys: Vec<ForeignKey>,
+    /// Nombre y sentencia de cada trigger asociado.
+    pub triggers: Vec<(String, String)>,
+    /// `CREATE TABLE` / `CREATE VIEW` original.
+    pub sql: Option<String>,
+}
+
+pub fn table_schema(conn: &Connection, name: &str) -> Result<TableSchema> {
+    let mut schema = TableSchema::default();
+
+    let mut stmt =
+        conn.prepare("SELECT name, type, \"notnull\", dflt_value, pk FROM pragma_table_info(?1)")?;
+    schema.columns = stmt
+        .query_map([name], |row| {
+            Ok(ColumnInfo {
+                name: row.get(0)?,
+                decl_type: row.get(1)?,
+                not_null: row.get::<_, i64>(2)? != 0,
+                default: row.get(3)?,
+                primary_key: row.get(4)?,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()
+        .context("no se pudieron leer las columnas")?;
+
+    let mut stmt = conn.prepare(
+        "SELECT l.name, l.\"unique\", l.origin, l.partial, m.sql
+         FROM pragma_index_list(?1) AS l
+         LEFT JOIN sqlite_master AS m ON m.type = 'index' AND m.name = l.name
+         ORDER BY l.name",
+    )?;
+    let indexes = stmt
+        .query_map([name], |row| {
+            Ok(IndexInfo {
+                name: row.get(0)?,
+                unique: row.get::<_, i64>(1)? != 0,
+                origin: row.get(2)?,
+                partial: row.get::<_, i64>(3)? != 0,
+                columns: Vec::new(),
+                sql: row.get(4)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("no se pudieron leer los índices")?;
+    let mut stmt = conn.prepare("SELECT name FROM pragma_index_info(?1) ORDER BY seqno")?;
+    for mut index in indexes {
+        index.columns = stmt
+            .query_map([index.name.as_str()], |row| {
+                Ok(row
+                    .get::<_, Option<String>>(0)?
+                    .unwrap_or_else(|| "<expresión>".to_string()))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        schema.indexes.push(index);
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT id, \"table\", \"from\", \"to\", on_update, on_delete
+         FROM pragma_foreign_key_list(?1) ORDER BY id, seq",
+    )?;
+    let mut rows = stmt.query([name])?;
+    let mut current_id = None;
+    while let Some(row) = rows.next()? {
+        let id: i64 = row.get(0)?;
+        // `to` es NULL cuando la FK apunta implícitamente a la clave primaria.
+        let to = row
+            .get::<_, Option<String>>(3)?
+            .unwrap_or_else(|| "(clave primaria)".to_string());
+        if current_id != Some(id) {
+            current_id = Some(id);
+            schema.foreign_keys.push(ForeignKey {
+                from: Vec::new(),
+                table: row.get(1)?,
+                to: Vec::new(),
+                on_update: row.get(4)?,
+                on_delete: row.get(5)?,
+            });
+        }
+        if let Some(key) = schema.foreign_keys.last_mut() {
+            key.from.push(row.get(2)?);
+            key.to.push(to);
+        }
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND tbl_name = ?1 ORDER BY name",
+    )?;
+    schema.triggers = stmt
+        .query_map([name], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()
+        .context("no se pudieron leer los triggers")?;
+
+    schema.sql = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type IN ('table', 'view') AND name = ?1",
+            [name],
+            |row| row.get(0),
+        )
+        .ok();
+
+    Ok(schema)
+}
+
 /// `true` si la sentencia no modifica la base de datos. Si no compila, se trata como lectura:
 /// ejecutarla solo producirá el error de sintaxis.
 pub fn is_read_only(conn: &Connection, sql: &str) -> bool {
@@ -540,6 +678,71 @@ mod tests {
                 2 * ROW_LIMIT
             )
         );
+    }
+
+    #[test]
+    fn reads_columns_indexes_foreign_keys_and_triggers() {
+        let conn = memory();
+        conn.execute_batch(
+            "CREATE TABLE orders (
+                id INTEGER PRIMARY KEY,
+                item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                code TEXT UNIQUE,
+                status TEXT DEFAULT 'pending'
+            );
+            CREATE INDEX orders_status ON orders (status) WHERE status IS NOT NULL;
+            CREATE INDEX orders_lower ON orders (lower(code));
+            CREATE TRIGGER orders_touch AFTER UPDATE ON orders BEGIN SELECT 1; END;",
+        )
+        .unwrap();
+
+        let schema = table_schema(&conn, "orders").unwrap();
+        assert_eq!(
+            schema.columns[1],
+            ColumnInfo {
+                name: "item_id".to_string(),
+                decl_type: "INTEGER".to_string(),
+                not_null: true,
+                default: None,
+                primary_key: 0,
+            }
+        );
+        assert_eq!(schema.columns[0].primary_key, 1);
+        assert_eq!(schema.columns[3].default.as_deref(), Some("'pending'"));
+
+        let names: Vec<_> = schema.indexes.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["orders_lower", "orders_status", "sqlite_autoindex_orders_1"]
+        );
+        assert_eq!(schema.indexes[0].columns, vec!["<expresión>"]);
+        assert!(schema.indexes[1].partial);
+        assert!(schema.indexes[2].unique);
+        assert_eq!(schema.indexes[2].origin, "u");
+        assert!(schema.indexes[2].sql.is_none());
+
+        assert_eq!(
+            schema.foreign_keys,
+            vec![ForeignKey {
+                from: vec!["item_id".to_string()],
+                table: "items".to_string(),
+                to: vec!["id".to_string()],
+                on_update: "NO ACTION".to_string(),
+                on_delete: "CASCADE".to_string(),
+            }]
+        );
+        assert_eq!(schema.triggers.len(), 1);
+        assert_eq!(schema.triggers[0].0, "orders_touch");
+        assert!(schema.sql.unwrap().starts_with("CREATE TABLE orders"));
+    }
+
+    #[test]
+    fn view_schema_has_columns_and_sql() {
+        let conn = memory();
+        let schema = table_schema(&conn, "item_names").unwrap();
+        assert_eq!(schema.columns.len(), 1);
+        assert!(schema.indexes.is_empty());
+        assert!(schema.sql.unwrap().starts_with("CREATE VIEW"));
     }
 
     #[test]
