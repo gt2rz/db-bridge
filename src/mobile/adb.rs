@@ -1,19 +1,55 @@
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 
 use super::{Device, command_error};
 
+const ADB: &str = if cfg!(windows) { "adb.exe" } else { "adb" };
+
+/// Ruta de `adb`. Una app abierta desde Finder o el menú de inicio no hereda el `PATH` de la
+/// terminal, así que además del `PATH` se prueban `ANDROID_HOME`, `ANDROID_SDK_ROOT` y las
+/// carpetas por defecto del SDK y de Homebrew.
+fn adb_program() -> &'static Path {
+    static PROGRAM: OnceLock<PathBuf> = OnceLock::new();
+    PROGRAM.get_or_init(|| {
+        let in_path = std::env::var_os("PATH")
+            .map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
+            .unwrap_or_default();
+        let sdk_roots = ["ANDROID_HOME", "ANDROID_SDK_ROOT"]
+            .into_iter()
+            .filter_map(std::env::var_os)
+            .map(PathBuf::from)
+            .chain(dirs::home_dir().map(|home| {
+                if cfg!(target_os = "macos") {
+                    home.join("Library/Android/sdk")
+                } else {
+                    home.join("Android/Sdk")
+                }
+            }))
+            .chain(dirs::data_local_dir().map(|data| data.join("Android/Sdk")))
+            .map(|root| root.join("platform-tools"));
+        let fixed = ["/opt/homebrew/bin", "/usr/local/bin"].map(PathBuf::from);
+
+        in_path
+            .into_iter()
+            .chain(sdk_roots)
+            .chain(fixed)
+            .map(|directory| directory.join(ADB))
+            .find(|candidate| candidate.is_file())
+            .unwrap_or_else(|| PathBuf::from(ADB))
+    })
+}
+
 /// Ejecuta `adb`, contra `device` si se indica (`-s <serial>`) o contra el único conectado.
 fn adb(device: &str, args: &[&str]) -> Result<std::process::Output> {
-    let mut command = Command::new("adb");
+    let mut command = Command::new(adb_program());
     if !device.is_empty() {
         command.args(["-s", device]);
     }
-    command
-        .args(args)
-        .output()
-        .context("no se pudo ejecutar adb; revisa que esté instalado y en el PATH")
+    command.args(args).output().context(
+        "no se pudo ejecutar adb; instala Android SDK Platform Tools o añade su carpeta al PATH",
+    )
 }
 
 fn adb_shell(device: &str, args: &[&str]) -> Result<std::process::Output> {

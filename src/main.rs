@@ -1,3 +1,6 @@
+// En Windows, sin esto el .exe de release abre también una ventana de consola.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod app;
 mod db;
 mod diff;
