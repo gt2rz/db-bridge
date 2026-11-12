@@ -37,7 +37,7 @@ jobs:
       matrix:
         include:
           - platform: macos
-            os: macos-14
+            os: macos-latest
           - platform: linux
             os: ubuntu-22.04
           - platform: windows
@@ -48,7 +48,7 @@ jobs:
       VERSION: ${{ needs.release-please.outputs.version }}
       GH_TOKEN: ${{ github.token }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ needs.release-please.outputs.tag }}
 
