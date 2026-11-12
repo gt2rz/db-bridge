@@ -25,7 +25,7 @@ Construido en Rust con `eframe`/`egui` (UI nativa, sin WebView) y `rusqlite` (SQ
 - Menú contextual (clic derecho) en cada celda: ver valor, copiar, poner a `NULL` y eliminar fila (con confirmación).
 - Insertar filas con **+ Fila**: un formulario por columna en el que cada campo puede quedar por defecto (`DEFAULT`, `rowid`), ser `NULL` o llevar un valor.
 - Visor de valores: JSON formateado, textos largos completos y BLOB en hexadecimal con el tipo detectado (PNG, JPEG, PDF, SQLite…) y opción de guardarlo como archivo. Los textos largos o de varias líneas se recortan en la rejilla y se abren en el visor con doble clic.
-- `Live Watch`: re-extrae y re-ejecuta la consulta cada 2 segundos.
+- `Live Watch`, en el pie de la tabla: re-extrae y re-ejecuta la consulta cada 2 s (por defecto), 5 s, 30 s o 1 min, o se apaga. La elección se guarda entre sesiones.
 - Comparación con una línea base: **Fijar línea base** guarda el estado actual y **Ver cambios** muestra, por tabla, las filas insertadas, eliminadas y modificadas (celda a celda, `antes → después`), además de tablas nuevas, eliminadas o con columnas distintas. Con Live Watch la comparación se actualiza en cada extracción.
 - `Push automático` (activado por defecto): cada cambio, sea una edición de celda o un `INSERT`/`UPDATE`/`DELETE`/DDL desde el editor, se envía al simulador/dispositivo en cuanto se aplica.
 - `Push al emulador`: devuelve la BD editada al simulador/dispositivo a mano, por ejemplo con el push automático desactivado.
@@ -33,6 +33,10 @@ Construido en Rust con `eframe`/`egui` (UI nativa, sin WebView) y `rusqlite` (SQ
 - Consultas favoritas persistentes entre sesiones.
 - Soporte de WAL: copia `-wal` y `-shm`, y hace checkpoint antes de cada push.
 - Detección, extracción y push en segundo plano: la ventana sigue respondiendo mientras trabajan `adb` o `simctl`, con un indicador en la barra de estado.
+
+## Descarga
+
+Binarios para macOS (universal), Windows y Linux en la [página de descarga](https://gt2rz.github.io/db-bridge-landing/) o en [GitHub Releases](https://github.com/gt2rz/db-bridge/releases). La app de macOS no está firmada por Apple: la primera vez ábrela con clic derecho → Abrir.
 
 ## Requisitos
 
@@ -83,6 +87,18 @@ La herramienta busca el archivo en `Documents`, `Library/Application Support`, `
 Con un archivo local los cambios se escriben directamente en el archivo. Con un simulador/dispositivo se aplican primero en una copia local; con **Push automático** activo se envían en el acto, y si lo desactivas aparece «Cambios sin push» hasta que pulses **Push al emulador**. En Android se ejecuta `am force-stop`, se copia el archivo a `/data/local/tmp` y se mueve al contenedor con `run-as`; en iOS se cierra la app con `simctl terminate`. Vuelve a abrir la app para ver los cambios.
 
 > La copia de ida y vuelta se hace con `adb exec-out`/`adb push`, nunca con `adb shell cat > archivo`, para no corromper binarios por la traducción de fin de línea de la PTY.
+
+## Versiones y publicación
+
+- `.github/workflows/ci.yml`: formato, clippy y tests en Linux, macOS y Windows en cada push y PR.
+- `.github/workflows/release.yml`: [release-please](https://github.com/googleapis/release-please) mantiene una PR de versión a partir de los commits convencionales (`feat:`, `fix:`…). Al fusionarla actualiza `Cargo.toml`, `Cargo.lock` y `CHANGELOG.md`, crea la etiqueta `vX.Y.Z` y la Release, y compila y adjunta:
+  - `DB-Bridge-macOS-universal.dmg` (Apple Silicon + Intel, firma ad hoc),
+  - `db-bridge-windows-x86_64.zip`,
+  - `db-bridge-linux-x86_64.tar.gz`,
+  - y un `.sha256` de cada uno.
+- Mientras la versión sea `0.x`, `feat:` sube el parche (0.0.1 → 0.0.2) y un cambio incompatible (`feat!:`) sube la menor.
+- Los nombres de los archivos no llevan versión: la landing enlaza a `releases/latest/download/<archivo>`. Si se cambian, hay que cambiarlos también en `src/config.ts` de la landing.
+- Secreto opcional `LANDING_DISPATCH_TOKEN` (token fine-grained con permiso *Contents: write* sobre `gt2rz/db-bridge-landing`): al publicar una Release, la landing se recompila al momento. Sin él, la landing se actualiza en su compilación diaria.
 
 ## Arquitectura
 

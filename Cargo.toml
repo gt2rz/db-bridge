@@ -1,6 +1,6 @@
 [package]
 name = "db-bridge"
-version = "0.3.0"
+version = "0.0.1"
 edition = "2024"
 description = "Inspector SQLite de escritorio para apps offline-first: archivo local, simulador iOS y emulador Android"
 

@@ -1,0 +1,153 @@
+name: Release
+
+# Cada push a main actualiza la PR de versión de release-please (a partir de los commits
+# feat:/fix:). Al fusionarla se crea la etiqueta vX.Y.Z y la Release, y se compilan y suben los
+# binarios. Los nombres de los archivos no llevan la versión para que la landing pueda enlazar
+# siempre a releases/latest/download/<archivo>.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    name: Versión
+    runs-on: ubuntu-latest
+    outputs:
+      created: ${{ steps.release.outputs.release_created }}
+      tag: ${{ steps.release.outputs.tag_name }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - uses: googleapis/release-please-action@v4
+        id: release
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  build:
+    name: Compilar (${{ matrix.platform }})
+    needs: release-please
+    if: needs.release-please.outputs.created == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos
+            os: macos-14
+          - platform: linux
+            os: ubuntu-22.04
+          - platform: windows
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    env:
+      TAG: ${{ needs.release-please.outputs.tag }}
+      VERSION: ${{ needs.release-please.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release-please.outputs.tag }}
+
+      - name: Dependencias de sistema (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libxkbcommon-dev libwayland-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libgl1-mesa-dev
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.platform }}
+
+      - name: Compilar y empaquetar (macOS universal)
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: |
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+
+          app="dist/DB Bridge.app"
+          mkdir -p "$app/Contents/MacOS"
+          lipo -create -output "$app/Contents/MacOS/db-bridge" \
+            target/aarch64-apple-darwin/release/db-bridge \
+            target/x86_64-apple-darwin/release/db-bridge
+          cat > "$app/Contents/Info.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key><string>DB Bridge</string>
+            <key>CFBundleDisplayName</key><string>DB Bridge</string>
+            <key>CFBundleIdentifier</key><string>dev.gt2rz.db-bridge</string>
+            <key>CFBundleExecutable</key><string>db-bridge</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>${VERSION}</string>
+            <key>CFBundleVersion</key><string>${VERSION}</string>
+            <key>LSMinimumSystemVersion</key><string>11.0</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict>
+          </plist>
+          EOF
+          # Firma ad hoc: sin certificado de Apple, pero el bundle queda íntegro para Gatekeeper.
+          codesign --force --deep --sign - "$app"
+
+          mkdir -p dist/dmg
+          cp -R "$app" dist/dmg/
+          ln -s /Applications dist/dmg/Applications
+          hdiutil create -volname "DB Bridge" -srcfolder dist/dmg -ov -format UDZO \
+            dist/DB-Bridge-macOS-universal.dmg
+
+          cd dist
+          shasum -a 256 DB-Bridge-macOS-universal.dmg > DB-Bridge-macOS-universal.dmg.sha256
+
+      - name: Compilar y empaquetar (Linux)
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: |
+          cargo build --release --locked
+          mkdir -p dist/db-bridge
+          cp target/release/db-bridge README.md dist/db-bridge/
+          tar -C dist -czf dist/db-bridge-linux-x86_64.tar.gz db-bridge
+          cd dist
+          sha256sum db-bridge-linux-x86_64.tar.gz > db-bridge-linux-x86_64.tar.gz.sha256
+
+      - name: Compilar y empaquetar (Windows)
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          cargo build --release --locked
+          New-Item -ItemType Directory -Force dist/db-bridge | Out-Null
+          Copy-Item target/release/db-bridge.exe, README.md dist/db-bridge/
+          Compress-Archive -Path dist/db-bridge/* -DestinationPath dist/db-bridge-windows-x86_64.zip
+          $hash = (Get-FileHash dist/db-bridge-windows-x86_64.zip -Algorithm SHA256).Hash.ToLower()
+          "$hash  db-bridge-windows-x86_64.zip" | Out-File -Encoding ascii dist/db-bridge-windows-x86_64.zip.sha256
+
+      - name: Subir a la Release
+        shell: bash
+        run: |
+          shopt -s nullglob
+          gh release upload "$TAG" dist/*.dmg dist/*.tar.gz dist/*.zip dist/*.sha256 --clobber
+
+  landing:
+    name: Avisar a la landing
+    needs: [release-please, build]
+    if: needs.release-please.outputs.created == 'true'
+    runs-on: ubuntu-latest
+    env:
+      # Token opcional (fine-grained, permiso Contents: write sobre gt2rz/db-bridge-landing).
+      # Sin él, la landing recoge la versión nueva en su compilación diaria.
+      TOKEN: ${{ secrets.LANDING_DISPATCH_TOKEN }}
+    steps:
+      - name: Recompilar la landing
+        if: env.TOKEN != ''
+        run: |
+          curl --fail-with-body -X POST \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/gt2rz/db-bridge-landing/dispatches \
+            -d '{"event_type":"release"}'
