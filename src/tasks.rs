@@ -12,6 +12,7 @@ pub enum TaskKind {
     Pull,
     Push,
     CheckUpdate,
+    InstallUpdate,
 }
 
 impl TaskKind {
@@ -23,6 +24,7 @@ impl TaskKind {
             Self::Pull => "Extrayendo base de datos…",
             Self::Push => "Enviando al dispositivo…",
             Self::CheckUpdate => "Buscando actualizaciones…",
+            Self::InstallUpdate => "Instalando actualización…",
         }
     }
 }

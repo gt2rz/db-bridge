@@ -1,11 +1,13 @@
 //! Aviso de versiones nuevas: consulta la última Release publicada en GitHub como mucho una vez
-//! al día. No descarga ni instala nada; la interfaz solo enlaza a la página de la Release.
+//! al día. La instalación de la versión nueva está en `updater`.
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Página de descarga: detecta el sistema y enlaza al binario de la última Release.
+pub const DOWNLOAD_URL: &str = "https://gt2rz.github.io/db-bridge-landing/";
 const LATEST_RELEASE_URL: &str = "https://api.github.com/repos/gt2rz/db-bridge/releases/latest";
 const CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -66,14 +68,18 @@ fn parse_release(body: &str) -> Result<Release> {
     })
 }
 
-/// Pide a GitHub la última Release estable. Bloquea: se llama desde un hilo de `tasks`.
-pub fn fetch_latest() -> Result<Release> {
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_global(Some(TIMEOUT))
+/// Cliente HTTP con la versión en el `User-Agent`, que GitHub exige.
+pub fn agent(timeout: Duration) -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .timeout_global(Some(timeout))
         .user_agent(format!("db-bridge/{CURRENT_VERSION}"))
         .build()
-        .into();
-    let body = agent
+        .into()
+}
+
+/// Pide a GitHub la última Release estable. Bloquea: se llama desde un hilo de `tasks`.
+pub fn fetch_latest() -> Result<Release> {
+    let body = agent(TIMEOUT)
         .get(LATEST_RELEASE_URL)
         .header("Accept", "application/vnd.github+json")
         .call()

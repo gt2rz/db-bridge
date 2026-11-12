@@ -33,7 +33,7 @@ Construido en Rust con `eframe`/`egui` (UI nativa, sin WebView) y `rusqlite` (SQ
 - Consultas favoritas persistentes entre sesiones.
 - Soporte de WAL: copia `-wal` y `-shm`, y hace checkpoint antes de cada push.
 - Detección, extracción y push en segundo plano: la ventana sigue respondiendo mientras trabajan `adb` o `simctl`, con un indicador en la barra de estado.
-- Aviso de versiones nuevas: una banda en la parte superior enlaza a la Release, con opción de omitir esa versión. Se desactiva desde el número de versión de la barra de estado.
+- Actualizaciones: una banda en la parte superior avisa de la versión nueva y permite instalarla desde la app (**Actualizar** → **Reiniciar ahora**), abrir la página de descarga o las notas de la Release, u omitir esa versión. Se desactiva desde el número de versión de la barra de estado.
 
 ## Descarga
 
@@ -119,6 +119,7 @@ src/
 ├── sql_highlight.rs # resaltado de sintaxis del editor SQL
 ├── tasks.rs       # operaciones lentas en hilos aparte
 ├── update_check.rs # consulta de la última Release en GitHub
+├── updater.rs     # descarga, verificación e instalación de la versión nueva
 └── mobile/
     ├── mod.rs     # API común (pull/push/detect) y validación de entradas
     ├── adb.rs     # Android
@@ -137,7 +138,8 @@ Decisiones relevantes:
 - La línea base es una copia byte a byte del archivo y su `-wal` (no `VACUUM INTO`, que puede renumerar `rowid`). La comparación adjunta la copia con `ATTACH` y cruza las filas por clave primaria (o `rowid`); si la clave cambió entre versiones, compara filas completas con `EXCEPT` y no puede distinguir modificaciones. Se muestran hasta 200 filas por tabla y tipo de cambio; los contadores son exactos.
 - Los valores se mantienen tipados (`Null`, `Integer`, `Real`, `Text`, `Blob`) hasta el render y la exportación.
 - Los archivos extraídos se guardan en `$TMPDIR/db-bridge/{ios,android}/<app>/`, eliminando WAL/SHM obsoletos antes de cada extracción.
-- Al arrancar, y como mucho una vez al día, se consulta `api.github.com/repos/gt2rz/db-bridge/releases/latest` en segundo plano (sin datos del usuario, solo el `User-Agent` con la versión). La última Release conocida se guarda en los ajustes para seguir avisando sin red; los fallos se ignoran. Las prereleases y borradores no cuentan. No hay autoactualización: el binario de macOS solo tiene firma ad hoc.
+- Al arrancar, y como mucho una vez al día, se consulta `api.github.com/repos/gt2rz/db-bridge/releases/latest` en segundo plano (sin datos del usuario, solo el `User-Agent` con la versión). La última Release conocida se guarda en los ajustes para seguir avisando sin red; los fallos se ignoran. Las prereleases y borradores no cuentan.
+- **Actualizar** descarga el binario del sistema desde la Release (`releases/download/vX.Y.Z/…`), comprueba su `.sha256` y sustituye la instalación: en macOS monta el `.dmg`, copia el `.app` junto al actual con `ditto` y los intercambia con dos renombrados (si el segundo falla, se deshace el primero); en Windows y Linux usa `self-replace`. La versión nueva se arranca con **Reiniciar ahora**, que se desactiva mientras haya cambios sin push. Al descargarlo la propia app, el archivo no lleva el atributo de cuarentena y Gatekeeper no interviene. No se ofrece en builds de desarrollo, en arquitecturas sin binario publicado ni en macOS si la app se ejecuta trasladada (fuera de Aplicaciones con cuarentena); en esos casos, y si falla la instalación (por ejemplo, sin permiso de escritura en la carpeta), queda el enlace a la página de descarga. El flujo completo se prueba contra la Release publicada con `cargo test -- --ignored installs_the_published`.
 - Los ajustes, favoritos y conexiones recientes se guardan en `~/Library/Application Support/db-bridge/settings.json` (o el directorio de configuración equivalente del sistema).
 - Los identificadores de app y nombres de archivo se validan contra una lista blanca para no inyectar argumentos en las llamadas a `adb`/`xcrun`. El archivo puede ser un nombre o una ruta relativa al contenedor (nunca absoluta ni con `..`); con ruta, pull y push usan ese archivo exacto aunque haya otro con el mismo nombre. Los espacios solo se admiten en iOS, donde no interviene ningún shell.
 

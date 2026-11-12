@@ -7,6 +7,7 @@ use crate::sql_highlight;
 use crate::tasks::{TaskKind, Tasks};
 use crate::theme;
 use crate::update_check::{self, Release};
+use crate::updater::{self, Installation};
 use crate::value_view;
 use eframe::egui::{self, Color32, CornerRadius, Frame, Margin, RichText, Stroke};
 use rusqlite::types::Value;
@@ -138,6 +139,17 @@ enum TaskOutput {
         result: anyhow::Result<()>,
     },
     LatestRelease(anyhow::Result<Release>),
+    UpdateInstalled {
+        version: String,
+        result: anyhow::Result<()>,
+    },
+}
+
+/// Resultado de instalar una versión nueva desde la banda de aviso.
+enum UpdateInstall {
+    /// Versión ya instalada en disco; se usa al reiniciar.
+    Installed(String),
+    Failed(String),
 }
 
 pub struct DbBridgeApp {
@@ -178,6 +190,9 @@ pub struct DbBridgeApp {
     diff: Option<DatabaseDiff>,
     status: String,
     detect_notice: Option<DetectNotice>,
+    /// Instalación en marcha, o por qué no se puede actualizar desde la app.
+    installation: Result<Installation, String>,
+    update_install: Option<UpdateInstall>,
     new_favorite_name: String,
 }
 
@@ -215,6 +230,8 @@ impl DbBridgeApp {
             diff: None,
             status: "Abre un archivo o extrae la base de datos de un emulador.".to_string(),
             detect_notice: None,
+            installation: Installation::current().map_err(|error| format!("{error:#}")),
+            update_install: None,
             new_favorite_name: String::new(),
         };
         app.check_for_updates(false);
@@ -681,6 +698,9 @@ impl DbBridgeApp {
                     result,
                 }) => self.finish_push(revision, message, result),
                 Some(TaskOutput::LatestRelease(result)) => self.finish_check_for_updates(result),
+                Some(TaskOutput::UpdateInstalled { version, result }) => {
+                    self.finish_install_update(version, result);
+                }
                 None => {
                     self.status = format!("Error inesperado: «{}» se interrumpió.", kind.label());
                 }
@@ -1439,10 +1459,59 @@ impl DbBridgeApp {
         })
     }
 
+    /// Descarga e instala `version` en segundo plano; se aplica al reiniciar.
+    fn install_update(&mut self, version: String) {
+        let Ok(installation) = self.installation.clone() else {
+            return;
+        };
+        if self.tasks.is_running(TaskKind::InstallUpdate) {
+            return;
+        }
+        self.update_install = None;
+        self.tasks.spawn(TaskKind::InstallUpdate, move || {
+            let result = updater::install(&installation, &version);
+            TaskOutput::UpdateInstalled { version, result }
+        });
+    }
+
+    fn finish_install_update(&mut self, version: String, result: anyhow::Result<()>) {
+        match result {
+            Ok(()) => {
+                self.status = format!("DB Bridge {version} instalado: reinicia para usarlo.");
+                self.update_install = Some(UpdateInstall::Installed(version));
+            }
+            Err(error) => {
+                self.status = format!("No se pudo actualizar: {error:#}");
+                self.update_install = Some(UpdateInstall::Failed(format!("{error:#}")));
+            }
+        }
+    }
+
+    /// Abre la versión instalada y cierra esta ventana.
+    fn restart_into_update(&mut self, ctx: &egui::Context) {
+        let Ok(installation) = &self.installation else {
+            return;
+        };
+        match installation.relaunch() {
+            Ok(()) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            Err(error) => {
+                self.status = format!("No se pudo reiniciar: {error:#}");
+                self.update_install = Some(UpdateInstall::Failed(format!("{error:#}")));
+            }
+        }
+    }
+
     fn update_banner(&mut self, ui: &mut egui::Ui) {
         let Some(release) = self.available_update().cloned() else {
             return;
         };
+        let installing = self.tasks.is_running(TaskKind::InstallUpdate);
+        let installed = matches!(
+            &self.update_install,
+            Some(UpdateInstall::Installed(version)) if *version == release.version
+        );
+        let mut install = false;
+        let mut restart = false;
         let frame = Frame::NONE
             .fill(theme::RAISED)
             .inner_margin(Margin::symmetric(16, 6));
@@ -1450,17 +1519,51 @@ impl DbBridgeApp {
             .frame(frame)
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    theme::dot(ui, theme::ACCENT, 3.5);
-                    ui.label(
-                        RichText::new(format!(
+                    let message = if installing {
+                        ui.add(egui::Spinner::new().size(12.0).color(theme::ACCENT));
+                        format!("Descargando e instalando DB Bridge {}…", release.version)
+                    } else if installed {
+                        theme::dot(ui, theme::SUCCESS, 3.5);
+                        format!(
+                            "DB Bridge {} está instalado. Reinicia para usarlo.",
+                            release.version
+                        )
+                    } else {
+                        theme::dot(ui, theme::ACCENT, 3.5);
+                        format!(
                             "Hay una versión nueva de DB Bridge: {} (tienes la {}).",
                             release.version,
                             update_check::CURRENT_VERSION
-                        ))
-                        .size(12.5)
-                        .color(theme::TEXT),
-                    );
+                        )
+                    };
+                    ui.label(RichText::new(message).size(12.5).color(theme::TEXT));
+                    if !installing && let Some(UpdateInstall::Failed(error)) = &self.update_install
+                    {
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(format!("No se pudo actualizar: {error}"))
+                                    .size(12.0)
+                                    .color(theme::WARNING),
+                            )
+                            .truncate(),
+                        );
+                    }
+
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if installed {
+                            let busy = self.dirty || self.transfer_running();
+                            restart = ui
+                                .add_enabled(!busy, theme::primary_button("Reiniciar ahora"))
+                                .on_disabled_hover_text(
+                                    "Envía los cambios pendientes al dispositivo antes de \
+                                     reiniciar.",
+                                )
+                                .clicked();
+                            return;
+                        }
+                        if installing {
+                            return;
+                        }
                         if ui
                             .button("Omitir esta versión")
                             .on_hover_text("No volver a avisar hasta que salga otra.")
@@ -1470,15 +1573,45 @@ impl DbBridgeApp {
                             self.persist();
                         }
                         if ui
-                            .add(theme::primary_button("Descargar"))
-                            .on_hover_text("Abre la página de la Release con las novedades.")
+                            .button("Novedades")
+                            .on_hover_text("Abre las notas de la versión en GitHub.")
                             .clicked()
                         {
                             ui.ctx().open_url(egui::OpenUrl::new_tab(&release.url));
                         }
+                        let download = match &self.installation {
+                            Ok(_) => egui::Button::new("Descargar"),
+                            Err(_) => theme::primary_button("Descargar"),
+                        };
+                        let hover = match &self.installation {
+                            Ok(_) => "Abre la página de descarga.".to_string(),
+                            Err(reason) => format!(
+                                "Abre la página de descarga. No se puede actualizar desde la \
+                                 app: {reason}."
+                            ),
+                        };
+                        if ui.add(download).on_hover_text(hover).clicked() {
+                            ui.ctx()
+                                .open_url(egui::OpenUrl::new_tab(update_check::DOWNLOAD_URL));
+                        }
+                        if self.installation.is_ok() {
+                            install = ui
+                                .add(theme::primary_button("Actualizar"))
+                                .on_hover_text(
+                                    "Descarga la versión nueva, comprueba su SHA-256 y \
+                                     sustituye esta instalación. Se aplica al reiniciar.",
+                                )
+                                .clicked();
+                        }
                     });
                 });
             });
+        if install {
+            self.install_update(release.version);
+        }
+        if restart {
+            self.restart_into_update(ui.ctx());
+        }
     }
 
     fn handle_dropped_files(&mut self, ctx: &egui::Context) {
@@ -1830,7 +1963,8 @@ impl DbBridgeApp {
                         .button(format!("Descargar la {}", release.version))
                         .clicked()
                     {
-                        ui.ctx().open_url(egui::OpenUrl::new_tab(&release.url));
+                        ui.ctx()
+                            .open_url(egui::OpenUrl::new_tab(update_check::DOWNLOAD_URL));
                     }
                 }
                 Some(_) => {

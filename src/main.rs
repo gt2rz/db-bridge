@@ -11,6 +11,7 @@ mod sql_highlight;
 mod tasks;
 mod theme;
 mod update_check;
+mod updater;
 mod value_view;
 
 use app::DbBridgeApp;
