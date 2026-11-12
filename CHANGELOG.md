@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.1](https://github.com/gt2rz/db-bridge/compare/v0.1.0...v0.1.1) (2026-11-12)
+
+
+### Novedades
+
+* aviso de versiones nuevas desde GitHub Releases ([92c1647](https://github.com/gt2rz/db-bridge/commit/92c1647d20772ca4c44afd31c17340a069f9e84b))
+
 ## 0.1.0 (2026-11-12)
 
 
