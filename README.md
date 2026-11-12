@@ -17,6 +17,10 @@ Construido en Rust con `eframe`/`egui` (UI nativa, sin WebView) y `rusqlite` (SQ
 - Paginación de tablas y vistas en páginas de 200 filas, con el total de filas y controles de primera/anterior/siguiente/última. La página se conserva al refrescar y se ajusta si la tabla encoge.
 - Pantalla de bienvenida con selección de origen y conexiones recientes.
 - Editor SQL multilínea con resaltado de sintaxis, números de línea y `Ctrl/Cmd + Enter`.
+- Scripts de varias sentencias: se ejecutan en orden dentro de un savepoint (si una falla no se aplica ninguna, y el error indica cuál) y se muestra el resultado de la última. No admiten `BEGIN`; `VACUUM` y `PRAGMA journal_mode` deben ir solos.
+- **Plan**: `EXPLAIN QUERY PLAN` de la consulta del editor, como árbol.
+- **Historial** de las últimas 30 consultas escritas a mano, persistente entre sesiones.
+- Al explorar una tabla: ordenar con clic en la cabecera de una columna (ascendente, descendente, sin orden) y filtrar filas con un texto que se busca en todas las columnas. El total, la paginación y la consulta que muestra el editor reflejan el orden y el filtro.
 - Edición de celdas con doble clic, `Enter` para guardar y `Esc` para cancelar. Cerrar el editor sin cambiar el valor no escribe nada.
 - Menú contextual (clic derecho) en cada celda: ver valor, copiar, poner a `NULL` y eliminar fila (con confirmación).
 - Insertar filas con **+ Fila**: un formulario por columna en el que cada campo puede quedar por defecto (`DEFAULT`, `rowid`), ser `NULL` o llevar un valor.
@@ -160,7 +164,6 @@ Las pruebas cubren listado de tablas/vistas, consultas editables, `WITHOUT ROWID
 ## Limitaciones conocidas
 
 - El esquema se puede consultar pero no editar (sin DDL asistido ni migraciones).
-- El editor ejecuta una sentencia por vez.
 - Los BLOB se exportan a CSV/JSON como `<BLOB n bytes>` y no se pueden editar desde la tabla (sí verlos y guardarlos).
 - Las tablas con clave primaria compuesta son de solo lectura.
 - El refresh de `Live Watch` sustituye la copia temporal: si hay cambios sin push, se pausa para no perderlos.

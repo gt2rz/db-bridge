@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail};
+use rusqlite::fallible_iterator::FallibleIterator;
 use rusqlite::types::Value;
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Batch, Connection, OpenFlags, Statement};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -30,6 +31,17 @@ pub struct QueryResult {
     pub modified: bool,
     /// Filas totales de la tabla al explorarla página a página.
     pub total: Option<u64>,
+    /// Sentencias ejecutadas (más de una en un script del editor).
+    pub statements: usize,
+}
+
+/// Cómo se está explorando una tabla: página, orden elegido en la cabecera y filtro de texto.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TableView {
+    pub page: usize,
+    /// Columna y sentido (`true` = descendente).
+    pub sort: Option<(String, bool)>,
+    pub filter: String,
 }
 
 impl QueryResult {
@@ -284,30 +296,87 @@ pub fn table_schema(conn: &Connection, name: &str) -> Result<TableSchema> {
 /// `true` si la sentencia no modifica la base de datos. Si no compila, se trata como lectura:
 /// ejecutarla solo producirá el error de sintaxis.
 pub fn is_read_only(conn: &Connection, sql: &str) -> bool {
-    conn.prepare(sql)
-        .map(|stmt| stmt.readonly())
-        .unwrap_or(true)
+    match conn.prepare(sql) {
+        Ok(stmt) => stmt.readonly(),
+        // Un script es de lectura si lo son todas sus sentencias. Si una no compila, el script
+        // fallará ahí sin haber ejecutado más que lecturas: se trata como de lectura.
+        Err(_) => {
+            let mut batch = Batch::new(conn, sql);
+            loop {
+                match batch.next() {
+                    Ok(Some(stmt)) if !stmt.readonly() => return false,
+                    Ok(Some(_)) => {}
+                    Ok(None) | Err(_) => return true,
+                }
+            }
+        }
+    }
 }
 
-pub fn run_query(conn: &Connection, sql: &str) -> Result<QueryResult> {
+/// Ejecuta el contenido del editor. Varias sentencias se ejecutan en orden dentro de un
+/// savepoint: si una falla, se deshacen todas. El resultado es el de la última.
+pub fn run_script(conn: &Connection, sql: &str) -> Result<QueryResult> {
+    // Una sola sentencia que compila va sin savepoint (VACUUM o PRAGMA journal_mode no
+    // admiten transacciones).
+    if conn.prepare(sql).is_ok() {
+        return run_query(conn, sql);
+    }
     let started = Instant::now();
-    let mut stmt = conn.prepare(sql).context("consulta SQL inválida")?;
+    conn.execute_batch("SAVEPOINT db_bridge_script")?;
+    match run_statements(conn, sql) {
+        Ok(mut result) => {
+            // Un COMMIT dentro del script ya cerró la transacción.
+            if !conn.is_autocommit() {
+                conn.execute_batch("RELEASE db_bridge_script")?;
+            }
+            result.elapsed = started.elapsed();
+            Ok(result)
+        }
+        Err(error) => {
+            if !conn.is_autocommit() {
+                let _ =
+                    conn.execute_batch("ROLLBACK TO db_bridge_script; RELEASE db_bridge_script");
+            }
+            Err(error)
+        }
+    }
+}
+
+fn run_statements(conn: &Connection, sql: &str) -> Result<QueryResult> {
+    let mut batch = Batch::new(conn, sql);
+    let mut executed = 0;
+    let mut modified = false;
+    let mut last = QueryResult::default();
+    // Cada sentencia se prepara después de ejecutar la anterior: puede usar una tabla que
+    // esta acaba de crear.
+    while let Some(mut stmt) = batch
+        .next()
+        .with_context(|| format!("sentencia {} inválida", executed + 1))?
+    {
+        executed += 1;
+        modified |= !stmt.readonly();
+        last = execute_statement(&mut stmt)
+            .with_context(|| format!("falló la sentencia {executed}"))?;
+    }
+    last.modified = modified;
+    last.statements = executed;
+    Ok(last)
+}
+
+/// Ejecuta una sentencia preparada: sus filas, o las filas afectadas si no devuelve columnas.
+fn execute_statement(stmt: &mut Statement<'_>) -> Result<QueryResult> {
     let column_count = stmt.column_count();
     let modified = !stmt.readonly();
-
     if column_count == 0 {
-        drop(stmt);
-        let affected = conn
-            .execute(sql, [])
+        let affected = stmt
+            .execute([])
             .context("no se pudo ejecutar la sentencia")?;
         return Ok(QueryResult {
             columns: vec!["filas afectadas".to_string()],
             rows: vec![vec![Value::Integer(affected as i64)]],
-            keys: Vec::new(),
-            key_expr: None,
-            elapsed: started.elapsed(),
             modified,
-            total: None,
+            statements: 1,
+            ..QueryResult::default()
         });
     }
 
@@ -315,68 +384,173 @@ pub fn run_query(conn: &Connection, sql: &str) -> Result<QueryResult> {
         .column_names()
         .map(|name| name.to_string())
         .collect::<Vec<_>>();
-
     let mut rows = stmt.query([])?;
     let mut data = Vec::new();
     while let Some(row) = rows.next()? {
-        let mut values = Vec::with_capacity(column_count);
-        for index in 0..column_count {
-            values.push(row.get::<_, Value>(index)?);
-        }
-        data.push(values);
+        data.push(
+            (0..column_count)
+                .map(|index| row.get::<_, Value>(index))
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+        );
     }
-
     Ok(QueryResult {
         columns,
         rows: data,
-        keys: Vec::new(),
-        key_expr: None,
-        elapsed: started.elapsed(),
         modified,
-        total: None,
+        statements: 1,
+        ..QueryResult::default()
     })
 }
 
-/// Consulta que muestra el editor al abrir una página de una tabla.
-pub fn table_page_sql(object: &DbObject, page: usize) -> String {
-    let name = quote_ident(&object.name);
-    match page {
-        0 => format!("SELECT * FROM {name} LIMIT {ROW_LIMIT};"),
-        _ => format!(
-            "SELECT * FROM {name} LIMIT {ROW_LIMIT} OFFSET {};",
-            page * ROW_LIMIT
-        ),
+/// `EXPLAIN QUERY PLAN` de una sentencia, como árbol indentado en una sola columna.
+pub fn query_plan(conn: &Connection, sql: &str) -> Result<QueryResult> {
+    let started = Instant::now();
+    let sql = sql.trim().trim_end_matches(';');
+    let mut stmt = conn
+        .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+        .context("el plan solo se puede pedir para una sentencia válida")?;
+    let mut rows = stmt.query([])?;
+    let mut depths: Vec<(i64, usize)> = Vec::new();
+    let mut lines = Vec::new();
+    while let Some(row) = rows.next()? {
+        let id: i64 = row.get(0)?;
+        let parent: i64 = row.get(1)?;
+        let detail: String = row.get(3)?;
+        let depth = depths
+            .iter()
+            .find(|(node, _)| *node == parent)
+            .map_or(0, |(_, depth)| depth + 1);
+        depths.push((id, depth));
+        lines.push(vec![Value::Text(format!(
+            "{}{}{detail}",
+            "   ".repeat(depth),
+            if depth > 0 { "└─ " } else { "" }
+        ))]);
     }
+    Ok(QueryResult {
+        columns: vec!["plan".to_string()],
+        rows: lines,
+        elapsed: started.elapsed(),
+        statements: 1,
+        ..QueryResult::default()
+    })
 }
 
-/// Lee una página de la tabla y su número total de filas. Con clave, las filas van ordenadas
-/// por ella para que las páginas no se solapen ni dejen huecos.
+pub fn run_query(conn: &Connection, sql: &str) -> Result<QueryResult> {
+    let started = Instant::now();
+    let mut stmt = conn.prepare(sql).context("consulta SQL inválida")?;
+    let mut result = execute_statement(&mut stmt)?;
+    result.elapsed = started.elapsed();
+    Ok(result)
+}
+
+/// Filtro (`WHERE`) y orden elegido (sin la clave) de una vista de tabla, ya como SQL. El
+/// texto del filtro va como literal escapado para que la consulta del editor sea ejecutable.
+fn view_clauses(
+    conn: &Connection,
+    object: &DbObject,
+    view: &TableView,
+) -> Result<(String, Option<String>)> {
+    let columns = conn
+        .prepare("SELECT name FROM pragma_table_info(?1)")?
+        .query_map([object.name.as_str()], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let filter = view.filter.trim();
+    let where_clause = if filter.is_empty() || columns.is_empty() {
+        String::new()
+    } else {
+        let escaped = filter
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let pattern = format!("'%{}%'", escaped.replace('\'', "''"));
+        let conditions = columns
+            .iter()
+            .map(|column| {
+                format!(
+                    "CAST({} AS TEXT) LIKE {pattern} ESCAPE '\\'",
+                    quote_ident(column)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        format!(" WHERE ({conditions})")
+    };
+
+    let sort = view
+        .sort
+        .as_ref()
+        .filter(|(column, _)| columns.contains(column))
+        .map(|(column, descending)| {
+            format!(
+                "{} {}",
+                quote_ident(column),
+                if *descending { "DESC" } else { "ASC" }
+            )
+        });
+    Ok((where_clause, sort))
+}
+
+/// Consulta que muestra el editor al abrir una página de una tabla.
+pub fn table_page_sql(conn: &Connection, object: &DbObject, view: &TableView) -> String {
+    let (where_clause, sort) = view_clauses(conn, object, view).unwrap_or_default();
+    let order = sort
+        .map(|sort| format!(" ORDER BY {sort}"))
+        .unwrap_or_default();
+    let offset = match view.page {
+        0 => String::new(),
+        page => format!(" OFFSET {}", page * ROW_LIMIT),
+    };
+    format!(
+        "SELECT * FROM {}{where_clause}{order} LIMIT {ROW_LIMIT}{offset};",
+        quote_ident(&object.name)
+    )
+}
+
+/// Lee una página de la tabla (filtrada y ordenada según `view`) y su número total de filas.
+/// Con clave, las filas van ordenadas también por ella para que las páginas no se solapen ni
+/// dejen huecos.
 pub fn run_table_query(
     conn: &Connection,
     object: &DbObject,
     limit: usize,
-    offset: usize,
+    view: &TableView,
 ) -> Result<QueryResult> {
     let started = Instant::now();
+    let (where_clause, sort) = view_clauses(conn, object, view)?;
+    let table = quote_ident(&object.name);
+    let offset = view.page * limit;
     let total = conn
         .query_row(
-            &format!("SELECT COUNT(*) FROM {}", quote_ident(&object.name)),
+            &format!("SELECT COUNT(*) FROM {table}{where_clause}"),
             [],
             |row| row.get::<_, i64>(0),
         )
         .context("no se pudo contar las filas")?;
 
     let keyed = match key_expression(conn, object)? {
-        Some(key_expr) => query_with_key(conn, object, &key_expr, limit, offset).ok(),
+        Some(key_expr) => {
+            let order = match &sort {
+                Some(sort) => format!("{sort}, {key_expr}"),
+                None => key_expr.clone(),
+            };
+            let sql = format!(
+                "SELECT {key_expr} AS __db_key, * FROM {table}{where_clause} \
+                 ORDER BY {order} LIMIT {limit} OFFSET {offset}"
+            );
+            query_with_key(conn, &sql, &key_expr).ok()
+        }
         None => None,
     };
     let mut result = match keyed {
         Some(result) => result,
         None => {
-            let sql = format!(
-                "SELECT * FROM {} LIMIT {limit} OFFSET {offset}",
-                quote_ident(&object.name)
-            );
+            let order = sort
+                .map(|sort| format!(" ORDER BY {sort}"))
+                .unwrap_or_default();
+            let sql =
+                format!("SELECT * FROM {table}{where_clause}{order} LIMIT {limit} OFFSET {offset}");
             let mut result = run_query(conn, &sql)?;
             result.key_expr = None;
             result
@@ -387,18 +561,9 @@ pub fn run_table_query(
     Ok(result)
 }
 
-fn query_with_key(
-    conn: &Connection,
-    object: &DbObject,
-    key_expr: &str,
-    limit: usize,
-    offset: usize,
-) -> Result<QueryResult> {
-    let sql = format!(
-        "SELECT {key_expr} AS __db_key, * FROM {} ORDER BY {key_expr} LIMIT {limit} OFFSET {offset}",
-        quote_ident(&object.name),
-    );
-    let mut stmt = conn.prepare(&sql)?;
+/// Ejecuta `sql`, cuya primera columna es `__db_key`, y separa la clave de cada fila.
+fn query_with_key(conn: &Connection, sql: &str, key_expr: &str) -> Result<QueryResult> {
+    let mut stmt = conn.prepare(sql)?;
     let column_count = stmt.column_count();
     if column_count < 2 {
         bail!("la tabla no expone filas consultables");
@@ -437,6 +602,7 @@ fn query_with_key(
         elapsed: Duration::ZERO,
         modified: false,
         total: None,
+        statements: 1,
     })
 }
 
@@ -641,7 +807,7 @@ mod tests {
     fn table_query_is_editable_and_updates_cells() {
         let conn = memory();
         let items = object(&conn, "items");
-        let result = run_table_query(&conn, &items, 10, 0).unwrap();
+        let result = run_table_query(&conn, &items, 10, &TableView::default()).unwrap();
         assert!(result.is_editable());
         assert_eq!(result.columns, vec!["id", "name", "qty", "price"]);
         assert_eq!(result.rows.len(), 2);
@@ -658,7 +824,7 @@ mod tests {
         .unwrap();
         assert_eq!(updated, 1);
 
-        let reloaded = run_table_query(&conn, &items, 10, 0).unwrap();
+        let reloaded = run_table_query(&conn, &items, 10, &TableView::default()).unwrap();
         assert_eq!(
             reloaded.rows[0][1],
             Value::Text("teclado mecánico".to_string())
@@ -675,14 +841,14 @@ mod tests {
         .unwrap();
         let items = object(&conn, "items");
 
-        let first = run_table_query(&conn, &items, 2, 0).unwrap();
-        let last = run_table_query(&conn, &items, 2, 4).unwrap();
+        let first = run_table_query(&conn, &items, 2, &page(0)).unwrap();
+        let last = run_table_query(&conn, &items, 2, &page(2)).unwrap();
         assert_eq!(first.total, Some(5));
         assert_eq!(first.keys, vec![Value::Integer(1), Value::Integer(2)]);
         assert_eq!(last.keys, vec![Value::Integer(5)]);
         assert!(last.is_editable());
 
-        let beyond = run_table_query(&conn, &items, 2, 10).unwrap();
+        let beyond = run_table_query(&conn, &items, 2, &page(5)).unwrap();
         assert!(beyond.rows.is_empty());
         assert_eq!(beyond.total, Some(5));
     }
@@ -691,10 +857,17 @@ mod tests {
     fn views_are_paged_without_key() {
         let conn = memory();
         let view = object(&conn, "item_names");
-        let page = run_table_query(&conn, &view, 1, 1).unwrap();
+        let page = run_table_query(&conn, &view, 1, &page(1)).unwrap();
         assert_eq!(page.rows, vec![vec![Value::Text("mouse".to_string())]]);
         assert_eq!(page.total, Some(2));
         assert!(!page.is_editable());
+    }
+
+    fn page(page: usize) -> TableView {
+        TableView {
+            page,
+            ..TableView::default()
+        }
     }
 
     #[test]
@@ -702,16 +875,127 @@ mod tests {
         let conn = memory();
         let items = object(&conn, "items");
         assert_eq!(
-            table_page_sql(&items, 0),
+            table_page_sql(&conn, &items, &page(0)),
             format!("SELECT * FROM \"items\" LIMIT {ROW_LIMIT};")
         );
         assert_eq!(
-            table_page_sql(&items, 2),
+            table_page_sql(&conn, &items, &page(2)),
             format!(
                 "SELECT * FROM \"items\" LIMIT {ROW_LIMIT} OFFSET {};",
                 2 * ROW_LIMIT
             )
         );
+    }
+
+    #[test]
+    fn filters_across_columns_and_sorts_by_the_chosen_column() {
+        let conn = memory();
+        conn.execute_batch("INSERT INTO items (name, qty) VALUES ('50%_off', 1), ('ratón', 9);")
+            .unwrap();
+        let items = object(&conn, "items");
+
+        let by_qty = TableView {
+            sort: Some(("qty".to_string(), true)),
+            ..TableView::default()
+        };
+        let sorted = run_table_query(&conn, &items, 10, &by_qty).unwrap();
+        let qty: Vec<_> = sorted.rows.iter().map(|row| row[2].clone()).collect();
+        assert_eq!(
+            qty,
+            vec![
+                Value::Integer(9),
+                Value::Integer(3),
+                Value::Integer(1),
+                Value::Null
+            ]
+        );
+        assert!(sorted.is_editable());
+
+        // Busca en todas las columnas (también números) sin distinguir mayúsculas.
+        let filtered = |text: &str| {
+            let view = TableView {
+                filter: text.to_string(),
+                ..TableView::default()
+            };
+            run_table_query(&conn, &items, 10, &view).unwrap()
+        };
+        assert_eq!(filtered("TECLA").total, Some(1));
+        // price 19.5, price 9.0 y qty 9.
+        assert_eq!(filtered("9").total, Some(3));
+        // % y _ se buscan literalmente, y la comilla no rompe la consulta.
+        assert_eq!(filtered("%_").total, Some(1));
+        assert_eq!(filtered("o'brien").total, Some(0));
+
+        let view = TableView {
+            filter: "o'k".to_string(),
+            sort: Some(("name".to_string(), false)),
+            page: 0,
+        };
+        let sql = table_page_sql(&conn, &items, &view);
+        assert!(sql.contains("LIKE '%o''k%' ESCAPE"));
+        assert!(sql.contains("ORDER BY \"name\" ASC"));
+        run_query(&conn, sql.trim_end_matches(';')).unwrap();
+    }
+
+    #[test]
+    fn scripts_run_in_order_and_return_the_last_result() {
+        let conn = memory();
+        let result = run_script(
+            &conn,
+            "CREATE TABLE tags (name TEXT);
+             INSERT INTO tags VALUES ('a'), ('b');
+             SELECT count(*) AS n FROM tags;",
+        )
+        .unwrap();
+        assert_eq!(result.statements, 3);
+        assert!(result.modified);
+        assert_eq!(result.rows, vec![vec![Value::Integer(2)]]);
+
+        let single = run_script(&conn, "SELECT 1;").unwrap();
+        assert_eq!(single.statements, 1);
+        assert!(!single.modified);
+    }
+
+    #[test]
+    fn a_failing_script_rolls_back_every_statement() {
+        let conn = memory();
+        let error = run_script(
+            &conn,
+            "DELETE FROM items; INSERT INTO nope VALUES (1); SELECT 1;",
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("sentencia 2"), "{error:#}");
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM items", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
+        assert!(conn.is_autocommit(), "no queda ninguna transacción abierta");
+    }
+
+    #[test]
+    fn scripts_are_read_only_only_if_every_statement_is() {
+        let conn = memory();
+        assert!(is_read_only(&conn, "SELECT 1; SELECT * FROM items;"));
+        assert!(!is_read_only(&conn, "SELECT 1; DELETE FROM items;"));
+        assert!(is_read_only(&conn, "SELEC mal escrito"));
+    }
+
+    #[test]
+    fn query_plan_is_an_indented_tree() {
+        let conn = memory();
+        let plan = query_plan(
+            &conn,
+            "SELECT * FROM items WHERE id IN (SELECT rowid FROM items WHERE qty > 1);",
+        )
+        .unwrap();
+        assert_eq!(plan.columns, vec!["plan"]);
+        assert!(!plan.rows.is_empty());
+        let lines: Vec<String> = plan.rows.iter().map(|row| value_display(&row[0])).collect();
+        assert!(
+            lines.iter().any(|line| line.starts_with("   └─ ")),
+            "{lines:?}"
+        );
+        assert!(query_plan(&conn, "SELECT 1; SELECT 2").is_err());
     }
 
     #[test]
@@ -818,7 +1102,7 @@ mod tests {
     fn without_rowid_table_uses_primary_key() {
         let conn = memory();
         let kv = object(&conn, "kv");
-        let result = run_table_query(&conn, &kv, 10, 0).unwrap();
+        let result = run_table_query(&conn, &kv, 10, &TableView::default()).unwrap();
         assert!(result.is_editable());
         assert_eq!(result.key_expr.as_deref(), Some("\"k\""));
         assert_eq!(result.keys[0], Value::Text("a".to_string()));
@@ -839,7 +1123,7 @@ mod tests {
     fn views_are_read_only() {
         let conn = memory();
         let view = object(&conn, "item_names");
-        let result = run_table_query(&conn, &view, 10, 0).unwrap();
+        let result = run_table_query(&conn, &view, 10, &TableView::default()).unwrap();
         assert!(!result.is_editable());
         assert_eq!(result.key_expr, None);
         assert_eq!(result.rows.len(), 2);
@@ -853,7 +1137,7 @@ mod tests {
         conn.execute(r#"INSERT INTO "we""ird" ("col""name") VALUES ('ok');"#, [])
             .unwrap();
         let weird = object(&conn, "we\"ird");
-        let result = run_table_query(&conn, &weird, 10, 0).unwrap();
+        let result = run_table_query(&conn, &weird, 10, &TableView::default()).unwrap();
         assert_eq!(result.columns, vec!["col\"name"]);
         assert_eq!(result.rows[0][0], Value::Text("ok".to_string()));
         update_cell(
@@ -865,7 +1149,7 @@ mod tests {
             &Value::Text("still ok".to_string()),
         )
         .unwrap();
-        let reloaded = run_table_query(&conn, &weird, 10, 0).unwrap();
+        let reloaded = run_table_query(&conn, &weird, 10, &TableView::default()).unwrap();
         assert_eq!(reloaded.rows[0][0], Value::Text("still ok".to_string()));
     }
 

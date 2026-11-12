@@ -16,6 +16,7 @@ const DEFAULT_SQL: &str =
     "SELECT name, type FROM sqlite_master WHERE type IN ('table', 'view') ORDER BY name;";
 const LIVE_WATCH_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_RECENTS: usize = 5;
+const MAX_HISTORY: usize = 30;
 
 struct CellEdit {
     row: usize,
@@ -132,8 +133,8 @@ pub struct DbBridgeApp {
     table_filter: String,
     sql: String,
     generated_sql: Option<String>,
-    /// Página de la tabla seleccionada (de `db::ROW_LIMIT` filas) mientras se explora.
-    page: usize,
+    /// Página, orden y filtro de la tabla seleccionada mientras se explora.
+    view: db::TableView,
     result: QueryResult,
     results_tab: ResultsTab,
     /// Esquema de la tabla seleccionada, cargado al abrir la pestaña y guardado con su nombre.
@@ -176,7 +177,7 @@ impl DbBridgeApp {
             table_filter: String::new(),
             sql: DEFAULT_SQL.to_string(),
             generated_sql: None,
-            page: 0,
+            view: db::TableView::default(),
             result: QueryResult::default(),
             results_tab: ResultsTab::Data,
             schema: None,
@@ -741,18 +742,71 @@ impl DbBridgeApp {
     fn select_object(&mut self, object: DbObject) {
         self.selected = Some(object);
         self.diff = None;
+        self.view = db::TableView::default();
         self.go_to_page(0);
     }
 
     fn go_to_page(&mut self, page: usize) {
-        let Some(object) = &self.selected else {
+        self.view.page = page;
+        self.load_view();
+    }
+
+    /// Clic en la cabecera de una columna: ascendente → descendente → sin orden.
+    fn toggle_sort(&mut self, column: &str) {
+        self.view.sort = match &self.view.sort {
+            Some((current, false)) if current == column => Some((column.to_string(), true)),
+            Some((current, true)) if current == column => None,
+            _ => Some((column.to_string(), false)),
+        };
+        self.view.page = 0;
+        self.load_view();
+    }
+
+    /// Ejecuta la consulta de la vista de tabla actual y la muestra en el editor.
+    fn load_view(&mut self) {
+        let (Some(object), Some(path)) = (&self.selected, &self.db_path) else {
             return;
         };
-        self.page = page;
-        self.sql = db::table_page_sql(object, page);
+        if let Ok(conn) = db::open(path) {
+            self.sql = db::table_page_sql(&conn, object, &self.view);
+        }
         self.generated_sql = Some(self.sql.clone());
         self.editing = None;
         self.run_sql();
+    }
+
+    fn remember_query(&mut self) {
+        let sql = self.sql.trim().to_string();
+        if sql.is_empty() || sql == DEFAULT_SQL {
+            return;
+        }
+        let history = &mut self.settings.history;
+        if history.first() == Some(&sql) {
+            return;
+        }
+        history.retain(|previous| *previous != sql);
+        history.insert(0, sql);
+        history.truncate(MAX_HISTORY);
+        self.persist();
+    }
+
+    fn explain(&mut self) {
+        let Some(path) = self.db_path.clone() else {
+            return;
+        };
+        if self.tasks.is_running(TaskKind::Pull) {
+            self.status = "Espera a que termine la extracción en curso.".to_string();
+            return;
+        }
+        match db::open(&path).and_then(|conn| db::query_plan(&conn, &self.sql)) {
+            Ok(plan) => {
+                self.status = format!("Plan de consulta · {} pasos", plan.rows.len());
+                self.result = plan;
+                self.results_tab = ResultsTab::Data;
+                self.editing = None;
+            }
+            Err(error) => self.status = format!("Error SQL: {error:#}"),
+        }
     }
 
     fn refresh(&mut self) {
@@ -808,20 +862,19 @@ impl DbBridgeApp {
         let outcome = if is_generated {
             self.selected
                 .as_ref()
-                .map(|object| {
-                    db::run_table_query(&conn, object, db::ROW_LIMIT, self.page * db::ROW_LIMIT)
-                })
-                .unwrap_or_else(|| db::run_query(&conn, &self.sql))
+                .map(|object| db::run_table_query(&conn, object, db::ROW_LIMIT, &self.view))
+                .unwrap_or_else(|| db::run_script(&conn, &self.sql))
         } else {
-            db::run_query(&conn, &self.sql)
+            db::run_script(&conn, &self.sql)
         };
+        drop(conn);
 
         match outcome {
             Ok(result) => {
                 // La tabla encogió (Live Watch, Refrescar) y la página ya no existe.
                 if let Some(total) = result.total {
                     let last_page = last_page(total);
-                    if self.page > last_page {
+                    if self.view.page > last_page {
                         self.go_to_page(last_page);
                         return;
                     }
@@ -829,9 +882,20 @@ impl DbBridgeApp {
                 let rows = result.rows.len();
                 let elapsed = result.elapsed.as_millis();
                 let modified = result.modified;
+                let statements = result.statements;
                 self.result = result;
+                if !is_generated {
+                    self.remember_query();
+                }
+                let executed = if statements > 1 {
+                    format!("{statements} sentencias ejecutadas")
+                } else {
+                    "Sentencia ejecutada".to_string()
+                };
                 if modified {
-                    self.record_change(format!("Sentencia ejecutada ({elapsed} ms)."));
+                    self.record_change(format!("{executed} ({elapsed} ms)."));
+                } else if statements > 1 {
+                    self.status = format!("{executed} · {rows} filas · {elapsed} ms");
                 } else {
                     self.status = format!("{rows} filas · {elapsed} ms");
                 }
@@ -2053,6 +2117,40 @@ impl DbBridgeApp {
                         {
                             self.refresh();
                         }
+                        if ui
+                            .add_enabled(self.db_path.is_some(), egui::Button::new("Plan"))
+                            .on_hover_text("EXPLAIN QUERY PLAN de la consulta del editor.")
+                            .clicked()
+                        {
+                            self.explain();
+                        }
+                        let mut chosen = None;
+                        ui.add_enabled_ui(!self.settings.history.is_empty(), |ui| {
+                            ui.menu_button("Historial", |ui| {
+                                ui.set_max_width(520.0);
+                                for sql in &self.settings.history {
+                                    let first_line = sql.lines().next().unwrap_or_default();
+                                    let label = value_view::cell_preview(sql)
+                                        .unwrap_or_else(|| first_line.to_string());
+                                    if ui
+                                        .add(egui::Button::new(theme::mono(label)).truncate())
+                                        .on_hover_text(theme::mono(sql.as_str()))
+                                        .clicked()
+                                    {
+                                        chosen = Some(sql.clone());
+                                        ui.close();
+                                    }
+                                }
+                            });
+                        });
+                        if let Some(sql) = chosen {
+                            self.sql = sql;
+                            self.generated_sql = None;
+                            self.selected = None;
+                            self.editing = None;
+                            self.status =
+                                "Consulta del historial cargada en el editor.".to_string();
+                        }
 
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.button("Limpiar").clicked() {
@@ -2159,12 +2257,28 @@ impl DbBridgeApp {
                         if self.results_tab == ResultsTab::Schema && self.selected.is_some() {
                             return;
                         }
+                        let table_view = self.selected.is_some()
+                            && self
+                                .generated_sql
+                                .as_deref()
+                                .is_some_and(|generated| generated.trim() == self.sql.trim());
+                        if table_view {
+                            let filter = ui.add(
+                                egui::TextEdit::singleline(&mut self.view.filter)
+                                    .hint_text("Filtrar filas…")
+                                    .desired_width(170.0),
+                            );
+                            if filter.changed() {
+                                self.view.page = 0;
+                                self.load_view();
+                            }
+                        }
 
                         if !self.result.columns.is_empty() {
                             let rows = self.result.rows.len();
                             let summary = match self.result.total {
                                 Some(total) if rows > 0 => {
-                                    let first = self.page * db::ROW_LIMIT + 1;
+                                    let first = self.view.page * db::ROW_LIMIT + 1;
                                     format!("filas {first}–{} de {total}", first + rows - 1)
                                 }
                                 Some(total) => format!("{total} filas"),
@@ -2275,7 +2389,7 @@ impl DbBridgeApp {
 
     /// Controles de página, de derecha a izquierda: » › «Página n de m» ‹ «.
     fn pager(&mut self, ui: &mut egui::Ui, last_page: usize) {
-        let page = self.page;
+        let page = self.view.page;
         let mut target = None;
         ui.spacing_mut().item_spacing.x = 2.0;
         let mut nav = |ui: &mut egui::Ui, text: &str, enabled: bool, to: usize, hint: &str| {
@@ -2321,6 +2435,9 @@ impl DbBridgeApp {
         let mut commit: Option<(usize, usize, String)> = None;
         let mut cancel = false;
         let mut action = None;
+        // Solo las páginas de una tabla (las que traen total) se ordenan desde la cabecera.
+        let sortable = self.result.total.is_some();
+        let mut sort_by: Option<String> = None;
 
         egui::ScrollArea::both()
             .id_salt("results_scroll")
@@ -2334,11 +2451,30 @@ impl DbBridgeApp {
                     .show(ui, |ui| {
                         ui.label(theme::mono("#").color(theme::FAINT));
                         for column in &self.result.columns {
-                            ui.label(
-                                theme::strong(column.as_str())
-                                    .size(12.5)
-                                    .color(theme::MUTED),
-                            );
+                            let arrow = match &self.view.sort {
+                                Some((sorted, false)) if sorted == column && sortable => " ▲",
+                                Some((sorted, true)) if sorted == column && sortable => " ▼",
+                                _ => "",
+                            };
+                            let color = if arrow.is_empty() {
+                                theme::MUTED
+                            } else {
+                                theme::ACCENT
+                            };
+                            let text = theme::strong(format!("{column}{arrow}"))
+                                .size(12.5)
+                                .color(color);
+                            if sortable {
+                                if ui
+                                    .add(egui::Button::new(text).frame(false))
+                                    .on_hover_text("Ordenar por esta columna")
+                                    .clicked()
+                                {
+                                    sort_by = Some(column.clone());
+                                }
+                            } else {
+                                ui.label(text);
+                            }
                         }
                         ui.end_row();
 
@@ -2470,6 +2606,9 @@ impl DbBridgeApp {
         }
         if let Some(action) = action {
             self.apply_cell_action(&ui.ctx().clone(), action);
+        }
+        if let Some(column) = sort_by {
+            self.toggle_sort(&column);
         }
     }
 }

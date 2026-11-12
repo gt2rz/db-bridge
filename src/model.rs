@@ -66,6 +66,8 @@ pub struct Settings {
     pub recents: Vec<RecentSource>,
     /// Envía al dispositivo cada cambio en cuanto se aplica en la copia local.
     pub auto_push: bool,
+    /// Últimas consultas escritas en el editor, de la más reciente a la más antigua.
+    pub history: Vec<String>,
 }
 
 impl Default for Settings {
@@ -78,6 +80,7 @@ impl Default for Settings {
             favorites: Vec::new(),
             recents: Vec::new(),
             auto_push: true,
+            history: Vec::new(),
         }
     }
 }
