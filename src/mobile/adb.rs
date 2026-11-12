@@ -67,7 +67,41 @@ pub fn list_devices() -> Result<Vec<Device>> {
             command_error("adb", &output)
         );
     }
-    Ok(parse_devices(&String::from_utf8_lossy(&output.stdout)))
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let devices = parse_devices(&stdout);
+    if devices.is_empty()
+        && let Some(problem) = unready_devices(&stdout).first()
+    {
+        bail!("{problem}");
+    }
+    Ok(devices)
+}
+
+/// Explica los dispositivos conectados que no admiten órdenes: sin esto un teléfono sin
+/// autorizar aparece como «ningún dispositivo».
+fn unready_devices(stdout: &str) -> Vec<String> {
+    stdout
+        .lines()
+        .skip_while(|line| !line.starts_with("List of devices"))
+        .skip(1)
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let serial = fields.next()?;
+            let problem = match fields.next()? {
+                "device" => return None,
+                "unauthorized" => format!(
+                    "{serial} no ha autorizado la depuración USB: desbloquea el teléfono y \
+                     acepta «Permitir depuración USB»"
+                ),
+                "offline" => format!(
+                    "{serial} aparece desconectado (offline): desconecta y vuelve a conectar \
+                     el cable, o reinicia adb con «adb kill-server»"
+                ),
+                state => format!("{serial} no está listo ({state})"),
+            };
+            Some(problem)
+        })
+        .collect()
 }
 
 /// Interpreta `adb devices -l`. Solo cuenta los dispositivos listos (`device`): los
@@ -300,6 +334,19 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn explains_devices_that_cannot_be_used() {
+        let stdout = "* daemon started successfully\n\
+            List of devices attached\n\
+            R58N123ABC             unauthorized usb:1-1 transport_id:2\n\
+            emulator-5554          offline transport_id:1\n\
+            emulator-5556          device product:sdk model:sdk transport_id:3\n";
+        let problems = unready_devices(stdout);
+        assert_eq!(problems.len(), 2);
+        assert!(problems[0].starts_with("R58N123ABC no ha autorizado"));
+        assert!(problems[1].starts_with("emulator-5554 aparece desconectado"));
     }
 
     #[test]

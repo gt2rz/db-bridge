@@ -165,6 +165,8 @@ Las apps offline-first suelen usar `PRAGMA journal_mode=WAL`. Por eso:
 | Mensaje | Causa | Solución |
 | --- | --- | --- |
 | `no se pudo ejecutar adb` | `adb` no está en el `PATH` | Añade `$ANDROID_HOME/platform-tools` al `PATH`. |
+| `… no ha autorizado la depuración USB` | El teléfono no aceptó el diálogo de depuración | Desbloquéalo y acepta «Permitir depuración USB»; si no aparece, reconecta el cable. |
+| `… aparece desconectado (offline)` | adb perdió la conexión con el dispositivo | Reconecta el cable o ejecuta `adb kill-server` y vuelve a pulsar **Detectar**. |
 | `no se pudo extraer ... ¿La app está compilada en modo debug?` | APK release o nombre incorrecto | Instala una build debug; revisa el nombre del archivo. |
 | `no se encontró ... en el simulador` | Simulador apagado o bundle ID incorrecto | Arranca el simulador y confirma el bundle ID con **Detectar**. |
 | `no se encontró «archivo» dentro del contenedor` | La app aún no creó la BD o usa otro nombre | Abre la app en el simulador y revisa el nombre/ruta. |

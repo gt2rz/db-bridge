@@ -85,6 +85,14 @@ struct Baseline {
     taken_at: Instant,
 }
 
+/// Detección que terminó sin resultado o con error. Se muestra junto a «Detectar» hasta la
+/// siguiente, porque en la barra de estado pasa desapercibida.
+struct DetectNotice {
+    message: String,
+    /// Modo al que ofrecer el cambio porque tiene dispositivos encendidos.
+    switch_to: Option<SourceMode>,
+}
+
 /// Base de datos de una app en un dispositivo concreto: de dónde se extrajo la copia local y,
 /// por tanto, adónde va su push aunque después cambien los selectores.
 #[derive(Clone, PartialEq)]
@@ -103,6 +111,8 @@ enum TaskOutput {
         /// Se pasa a la detección de apps que sigue a esta.
         fallback: bool,
         result: anyhow::Result<Vec<Device>>,
+        /// El otro modo móvil, si no se encontró nada en este y allí sí hay algo encendido.
+        elsewhere: Option<SourceMode>,
     },
     Apps {
         mode: SourceMode,
@@ -167,6 +177,7 @@ pub struct DbBridgeApp {
     /// Comparación mostrada en lugar del editor; se recalcula en cada reconexión.
     diff: Option<DatabaseDiff>,
     status: String,
+    detect_notice: Option<DetectNotice>,
     new_favorite_name: String,
 }
 
@@ -203,6 +214,7 @@ impl DbBridgeApp {
             baseline: None,
             diff: None,
             status: "Abre un archivo o extrae la base de datos de un emulador.".to_string(),
+            detect_notice: None,
             new_favorite_name: String::new(),
         };
         app.check_for_updates(false);
@@ -221,12 +233,42 @@ impl DbBridgeApp {
         if mode == SourceMode::Local {
             return;
         }
-        self.tasks
-            .spawn(TaskKind::DetectDevices, move || TaskOutput::Devices {
+        self.detect_notice = None;
+        self.tasks.spawn(TaskKind::DetectDevices, move || {
+            let result = mobile::detect_devices(mode);
+            let found = result.as_ref().is_ok_and(|devices| !devices.is_empty());
+            let elsewhere = other_mobile_mode(mode).filter(|other| {
+                !found && mobile::detect_devices(*other).is_ok_and(|devices| !devices.is_empty())
+            });
+            TaskOutput::Devices {
                 mode,
                 fallback,
-                result: mobile::detect_devices(mode),
-            });
+                result,
+                elsewhere,
+            }
+        });
+    }
+
+    /// Deja la detección sin resultado a la vista: en la barra de estado y junto a «Detectar».
+    fn detect_failed(&mut self, message: String, switch_to: Option<SourceMode>) {
+        self.status = message.clone();
+        self.detect_notice = Some(DetectNotice { message, switch_to });
+    }
+
+    fn change_mode(&mut self, mode: SourceMode) {
+        self.settings.mode = mode;
+        self.detected_devices.clear();
+        self.detected_apps.clear();
+        self.detected_dbs.clear();
+        self.detect_notice = None;
+        self.editing = None;
+        if mode == SourceMode::Local {
+            self.status = "Abre un archivo SQLite o arrástralo a la ventana.".to_string();
+        } else {
+            self.status = format!("{}: buscando dispositivos…", mode.label());
+            self.detect_devices(false);
+        }
+        self.persist();
     }
 
     fn finish_detect_devices(
@@ -234,20 +276,26 @@ impl DbBridgeApp {
         mode: SourceMode,
         fallback: bool,
         result: anyhow::Result<Vec<Device>>,
+        elsewhere: Option<SourceMode>,
     ) {
         if mode != self.settings.mode {
             return;
         }
+        let hint = match elsewhere {
+            Some(SourceMode::Ios) => " Sí hay un simulador de iOS encendido.",
+            Some(SourceMode::Android) => " Sí hay un dispositivo Android conectado.",
+            _ => "",
+        };
         match result {
             Ok(devices) if devices.is_empty() => {
                 self.detected_devices.clear();
                 self.detected_apps.clear();
                 self.detected_dbs.clear();
-                self.status = match mode {
+                let message = match mode {
                     SourceMode::Ios => "No hay ningún simulador de iOS encendido.",
                     _ => "No hay ningún dispositivo o emulador conectado a adb.",
-                }
-                .to_string();
+                };
+                self.detect_failed(format!("{message}{hint}"), elsewhere);
             }
             Ok(devices) => {
                 // Se conserva el elegido si sigue conectado; si no, el primero de la lista.
@@ -265,7 +313,10 @@ impl DbBridgeApp {
             }
             Err(error) => {
                 self.detected_devices.clear();
-                self.status = format!("No se pudieron listar los dispositivos: {error:#}");
+                self.detect_failed(
+                    format!("No se pudieron listar los dispositivos: {error:#}.{hint}"),
+                    elsewhere,
+                );
             }
         }
     }
@@ -312,8 +363,11 @@ impl DbBridgeApp {
         match result {
             Ok(apps) => {
                 if apps.is_empty() {
-                    self.status = "No se encontraron apps de usuario instaladas en el dispositivo."
-                        .to_string();
+                    self.detect_failed(
+                        "No se encontraron apps de usuario instaladas en el dispositivo."
+                            .to_string(),
+                        None,
+                    );
                 } else {
                     if self.settings.app_id.trim().is_empty()
                         || !apps.iter().any(|app| app == self.settings.app_id.trim())
@@ -326,7 +380,7 @@ impl DbBridgeApp {
                 self.detected_apps = apps;
             }
             Err(error) => {
-                self.status = format!("No se pudieron detectar apps: {error:#}");
+                self.detect_failed(format!("No se pudieron detectar apps: {error:#}"), None);
             }
         }
         if found_apps || (fallback && self.detected_apps.is_empty()) {
@@ -370,8 +424,11 @@ impl DbBridgeApp {
         match result {
             Ok(databases) => {
                 if databases.is_empty() {
-                    self.status = format!(
-                        "No se encontraron bases de datos en {app_id}. Escribe el nombre del archivo."
+                    self.detect_failed(
+                        format!(
+                            "No se encontraron bases de datos en {app_id}. Escribe el nombre del archivo."
+                        ),
+                        None,
                     );
                 } else {
                     // Un nombre guardado de antes («offline.db») se traduce a su ruta detectada.
@@ -392,7 +449,10 @@ impl DbBridgeApp {
             }
             Err(error) => {
                 self.detected_dbs.clear();
-                self.status = format!("No se pudieron detectar bases de datos: {error:#}");
+                self.detect_failed(
+                    format!("No se pudieron detectar bases de datos: {error:#}"),
+                    None,
+                );
             }
         }
     }
@@ -600,7 +660,8 @@ impl DbBridgeApp {
                     mode,
                     fallback,
                     result,
-                }) => self.finish_detect_devices(mode, fallback, result),
+                    elsewhere,
+                }) => self.finish_detect_devices(mode, fallback, result, elsewhere),
                 Some(TaskOutput::Apps {
                     mode,
                     device,
@@ -1478,15 +1539,9 @@ impl DbBridgeApp {
 
                 let modes = [SourceMode::Local, SourceMode::Ios, SourceMode::Android]
                     .map(|mode| (mode, mode.label()));
-                if theme::segmented(ui, &mut self.settings.mode, &modes) {
-                    self.detected_devices.clear();
-                    self.detected_apps.clear();
-                    self.detected_dbs.clear();
-                    self.editing = None;
-                    if self.settings.mode != SourceMode::Local {
-                        self.detect_devices(false);
-                    }
-                    self.persist();
+                let mut mode = self.settings.mode;
+                if theme::segmented(ui, &mut mode, &modes) {
+                    self.change_mode(mode);
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1668,6 +1723,29 @@ impl DbBridgeApp {
                     }
                 }
             });
+
+            let mut switch_to = None;
+            if let Some(notice) = &self.detect_notice
+                && self.settings.mode != SourceMode::Local
+            {
+                ui.add_space(6.0);
+                ui.horizontal_wrapped(|ui| {
+                    theme::dot(ui, theme::WARNING, 3.5);
+                    ui.label(
+                        RichText::new(notice.message.as_str())
+                            .size(12.5)
+                            .color(theme::WARNING),
+                    );
+                    if let Some(mode) = notice.switch_to
+                        && ui.button(format!("Cambiar a {}", mode.label())).clicked()
+                    {
+                        switch_to = Some(mode);
+                    }
+                });
+            }
+            if let Some(mode) = switch_to {
+                self.change_mode(mode);
+            }
         });
     }
 
@@ -3114,6 +3192,14 @@ fn format_age(elapsed: Duration) -> String {
 }
 
 /// Índice de la última página de una tabla con `total` filas (0 si está vacía).
+fn other_mobile_mode(mode: SourceMode) -> Option<SourceMode> {
+    match mode {
+        SourceMode::Ios => Some(SourceMode::Android),
+        SourceMode::Android => Some(SourceMode::Ios),
+        SourceMode::Local => None,
+    }
+}
+
 fn last_page(total: u64) -> usize {
     (total as usize).saturating_sub(1) / db::ROW_LIMIT
 }
