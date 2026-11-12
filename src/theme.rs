@@ -246,14 +246,15 @@ pub fn section_label(ui: &mut egui::Ui, text: &str) {
     );
 }
 
-pub fn badge(ui: &mut egui::Ui, text: &str, fg: Color32, bg: Color32) {
+pub fn badge(ui: &mut egui::Ui, text: &str, fg: Color32, bg: Color32) -> egui::Response {
     Frame::NONE
         .fill(bg)
         .corner_radius(CornerRadius::same(4))
         .inner_margin(Margin::symmetric(6, 1))
         .show(ui, |ui| {
             ui.label(RichText::new(text).size(11.0).color(fg));
-        });
+        })
+        .response
 }
 
 /// Campo con la etiqueta dentro del mismo marco que el control.

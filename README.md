@@ -18,6 +18,7 @@ Construido en Rust con `eframe`/`egui` (UI nativa, sin WebView) y `rusqlite` (SQ
 - Editor SQL multilínea con resaltado de sintaxis, números de línea y `Ctrl/Cmd + Enter`.
 - Edición de celdas con doble clic, `Enter` para guardar y `Esc` para cancelar.
 - `Live Watch`: re-extrae y re-ejecuta la consulta cada 2 segundos.
+- Comparación con una línea base: **Fijar línea base** guarda el estado actual y **Ver cambios** muestra, por tabla, las filas insertadas, eliminadas y modificadas (celda a celda, `antes → después`), además de tablas nuevas, eliminadas o con columnas distintas. Con Live Watch la comparación se actualiza en cada extracción.
 - `Push automático` (activado por defecto): cada cambio, sea una edición de celda o un `INSERT`/`UPDATE`/`DELETE`/DDL desde el editor, se envía al simulador/dispositivo en cuanto se aplica.
 - `Push al emulador`: devuelve la BD editada al simulador/dispositivo a mano, por ejemplo con el push automático desactivado.
 - Exportación de resultados a CSV (RFC 4180) y JSON (conserva números y `null`).
@@ -83,6 +84,7 @@ src/
 ├── app.rs         # estado de la UI y todos los paneles
 ├── model.rs       # SourceMode, Settings, FavoriteQuery
 ├── db.rs          # apertura, esquema, consultas, edición, export y tests
+├── diff.rs        # línea base y comparación de cambios por tabla
 ├── favorites.rs   # persistencia de ajustes y favoritos
 ├── theme.rs       # paleta, fuentes del sistema y estilos de egui
 ├── sql_highlight.rs # resaltado de sintaxis del editor SQL
@@ -102,6 +104,7 @@ Decisiones relevantes:
 - Detección, pull y push se lanzan en hilos (`tasks.rs`) y devuelven el resultado por un canal; los resultados que llegan después de cambiar de modo o de app se descartan. El push envía una copia instantánea (`push/` junto a la copia local), así que se puede seguir editando mientras se envía; los cambios que llegan con un push en curso se envían en otro al terminar. Mientras dura un pull no se ejecutan consultas ni ediciones, porque la copia local se está sobrescribiendo.
 - La copia local recuerda el dispositivo, la app y el archivo de los que se extrajo: el push, Refrescar y Live Watch usan siempre ese origen, aunque después se cambien los selectores.
 - Las páginas de una tabla se ordenan por su clave (`rowid` o la PK de las `WITHOUT ROWID`) para que no se solapen; las vistas y las tablas sin clave usan el orden de SQLite. Las consultas escritas a mano en el editor no se paginan: se ejecutan tal cual.
+- La línea base es una copia byte a byte del archivo y su `-wal` (no `VACUUM INTO`, que puede renumerar `rowid`). La comparación adjunta la copia con `ATTACH` y cruza las filas por clave primaria (o `rowid`); si la clave cambió entre versiones, compara filas completas con `EXCEPT` y no puede distinguir modificaciones. Se muestran hasta 200 filas por tabla y tipo de cambio; los contadores son exactos.
 - Los valores se mantienen tipados (`Null`, `Integer`, `Real`, `Text`, `Blob`) hasta el render y la exportación.
 - Los archivos extraídos se guardan en `$TMPDIR/db-bridge/{ios,android}/<app>/`, eliminando WAL/SHM obsoletos antes de cada extracción.
 - Los ajustes, favoritos y conexiones recientes se guardan en `~/Library/Application Support/db-bridge/settings.json` (o el directorio de configuración equivalente del sistema).

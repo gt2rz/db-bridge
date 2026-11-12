@@ -1,5 +1,6 @@
 mod app;
 mod db;
+mod diff;
 mod favorites;
 mod mobile;
 mod model;

@@ -1,4 +1,5 @@
 use crate::db::{self, DbObject, ObjectKind, QueryResult};
+use crate::diff::{self, DatabaseDiff, TableChange, TableDiff};
 use crate::favorites;
 use crate::mobile::{self, Device};
 use crate::model::{FavoriteQuery, RecentSource, Settings, SourceMode};
@@ -20,6 +21,14 @@ struct CellEdit {
     column: usize,
     buffer: String,
     focus_pending: bool,
+}
+
+/// Copia fijada de la BD conectada con la que se comparan los cambios posteriores.
+struct Baseline {
+    /// BD de la que se tomó: al conectar otra, la línea base deja de valer.
+    source: PathBuf,
+    copy: PathBuf,
+    taken_at: Instant,
 }
 
 /// Base de datos de una app en un dispositivo concreto: de dónde se extrajo la copia local y,
@@ -93,6 +102,9 @@ pub struct DbBridgeApp {
     /// Mensaje del último cambio que llegó con un push ya en curso; se envía al terminar este.
     queued_push: Option<String>,
     tasks: Tasks<TaskOutput>,
+    baseline: Option<Baseline>,
+    /// Comparación mostrada en lugar del editor; se recalcula en cada reconexión.
+    diff: Option<DatabaseDiff>,
     status: String,
     new_favorite_name: String,
 }
@@ -123,6 +135,8 @@ impl DbBridgeApp {
             change_revision: 0,
             queued_push: None,
             tasks: Tasks::new(cc.egui_ctx.clone()),
+            baseline: None,
+            diff: None,
             status: "Abre un archivo o extrae la base de datos de un emulador.".to_string(),
             new_favorite_name: String::new(),
         }
@@ -590,6 +604,17 @@ impl DbBridgeApp {
         }
         self.status = format!("Conectado: {origin}");
         self.origin = Some(origin);
+        if self
+            .baseline
+            .as_ref()
+            .is_some_and(|baseline| Some(&baseline.source) != self.db_path.as_ref())
+        {
+            self.baseline = None;
+            self.diff = None;
+        } else if self.diff.is_some() {
+            // Live Watch o Refrescar: la vista de cambios se mantiene al día.
+            self.compare_with_baseline();
+        }
         // Reconectar (Live Watch, Refrescar) no debe repetir un DELETE o UPDATE del editor.
         if db::is_read_only(&conn, &self.sql) {
             self.run_sql();
@@ -599,8 +624,65 @@ impl DbBridgeApp {
         true
     }
 
+    fn set_baseline(&mut self) {
+        let Some(source) = self.db_path.clone() else {
+            return;
+        };
+        if self.tasks.is_running(TaskKind::Pull) {
+            self.status = "Espera a que termine la extracción en curso.".to_string();
+            return;
+        }
+        let copy = std::env::temp_dir()
+            .join("db-bridge")
+            .join("baseline")
+            .join(std::process::id().to_string())
+            .join(source.file_name().unwrap_or_default());
+        match diff::snapshot(&source, &copy) {
+            Ok(()) => {
+                self.baseline = Some(Baseline {
+                    source,
+                    copy,
+                    taken_at: Instant::now(),
+                });
+                self.status = if self.target.is_some() {
+                    "Línea base fijada. Usa la app y pulsa Refrescar (o activa Live Watch) para ver los cambios."
+                } else {
+                    "Línea base fijada. Los cambios en el archivo aparecerán en «Ver cambios»."
+                }
+                .to_string();
+                if self.diff.is_some() {
+                    self.compare_with_baseline();
+                }
+            }
+            Err(error) => self.status = format!("No se pudo fijar la línea base: {error:#}"),
+        }
+    }
+
+    fn compare_with_baseline(&mut self) {
+        let (Some(current), Some(baseline)) = (&self.db_path, &self.baseline) else {
+            return;
+        };
+        match diff::compare(current, &baseline.copy) {
+            Ok(result) => {
+                self.editing = None;
+                self.diff = Some(result);
+            }
+            Err(error) => {
+                self.diff = None;
+                self.status = format!("No se pudo comparar con la línea base: {error:#}");
+            }
+        }
+    }
+
+    fn clear_baseline(&mut self) {
+        self.baseline = None;
+        self.diff = None;
+        self.status = "Línea base descartada.".to_string();
+    }
+
     fn select_object(&mut self, object: DbObject) {
         self.selected = Some(object);
+        self.diff = None;
         self.go_to_page(0);
     }
 
@@ -1225,6 +1307,7 @@ impl DbBridgeApp {
                                     self.sql = favorite.sql.clone();
                                     self.generated_sql = None;
                                     self.selected = None;
+                                    self.diff = None;
                                     self.editing = None;
                                     self.run_sql();
                                 }
@@ -1246,7 +1329,7 @@ impl DbBridgeApp {
             });
     }
 
-    fn connection_card(&self, ui: &mut egui::Ui) {
+    fn connection_card(&mut self, ui: &mut egui::Ui) {
         theme::card().inner_margin(Margin::same(12)).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.spacing_mut().item_spacing.y = 4.0;
@@ -1273,6 +1356,8 @@ impl DbBridgeApp {
                         ui.label(RichText::new(text).size(12.0).color(theme::SUBTLE))
                             .on_hover_text(detail);
                     }
+                    ui.add_space(6.0);
+                    self.baseline_controls(ui);
                 }
                 None => {
                     ui.horizontal(|ui| {
@@ -1289,11 +1374,156 @@ impl DbBridgeApp {
         });
     }
 
+    fn baseline_controls(&mut self, ui: &mut egui::Ui) {
+        let pulling = self.tasks.is_running(TaskKind::Pull);
+        match &self.baseline {
+            None => {
+                if ui
+                    .add_enabled(!pulling, egui::Button::new("Fijar línea base"))
+                    .on_hover_text(
+                        "Guarda una copia del estado actual para ver después qué filas \
+                         insertó, borró o modificó la app.",
+                    )
+                    .clicked()
+                {
+                    self.set_baseline();
+                }
+            }
+            Some(baseline) => {
+                let age = format_age(baseline.taken_at.elapsed());
+                ui.horizontal(|ui| {
+                    theme::dot(ui, theme::ACCENT, 3.5);
+                    ui.label(
+                        RichText::new(format!("Línea base · {age}"))
+                            .size(12.0)
+                            .color(theme::MUTED),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    let label = if self.diff.is_some() {
+                        "Ocultar cambios"
+                    } else {
+                        "Ver cambios"
+                    };
+                    if ui.add_enabled(!pulling, egui::Button::new(label)).clicked() {
+                        if self.diff.is_some() {
+                            self.diff = None;
+                        } else {
+                            self.compare_with_baseline();
+                        }
+                    }
+                    if ui
+                        .add_enabled(!pulling, egui::Button::new("Refijar"))
+                        .on_hover_text("Toma el estado actual como nueva línea base.")
+                        .clicked()
+                    {
+                        self.set_baseline();
+                    }
+                    let discard =
+                        egui::Button::new(RichText::new("×").size(15.0).color(theme::SUBTLE))
+                            .frame_when_inactive(false);
+                    if ui
+                        .add(discard)
+                        .on_hover_text("Descartar la línea base")
+                        .clicked()
+                    {
+                        self.clear_baseline();
+                    }
+                });
+            }
+        }
+    }
+
+    fn diff_card(&mut self, ui: &mut egui::Ui) {
+        let Some(diff) = self.diff.take() else {
+            return;
+        };
+        let mut close = false;
+        let mut recompute = false;
+
+        theme::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.set_min_height(ui.available_height());
+            ui.spacing_mut().item_spacing.y = 0.0;
+
+            Frame::NONE
+                .inner_margin(Margin::symmetric(14, 10))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(theme::strong("Cambios desde la línea base"));
+                        if let Some(baseline) = &self.baseline {
+                            ui.label(
+                                RichText::new(format_age(baseline.taken_at.elapsed()))
+                                    .color(theme::MUTED),
+                            );
+                        }
+                        let (inserted, deleted, updated) = diff.totals();
+                        change_counts(ui, inserted, deleted, updated);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            close = ui.button("Cerrar").clicked();
+                            recompute = ui
+                                .button("Recalcular")
+                                .on_hover_text("Vuelve a comparar la copia local actual.")
+                                .clicked();
+                        });
+                    });
+                });
+
+            ui.add(egui::Separator::default().spacing(0.0));
+
+            Frame::NONE
+                .inner_margin(Margin::symmetric(14, 10))
+                .show(ui, |ui| {
+                    if diff.tables.is_empty() {
+                        ui.add_space(24.0);
+                        ui.vertical_centered(|ui| {
+                            ui.label(
+                                RichText::new("Sin cambios desde la línea base")
+                                    .family(theme::semibold())
+                                    .color(theme::TEXT_SOFT),
+                            );
+                            ui.add_space(4.0);
+                            ui.label(
+                                RichText::new(if self.target.is_some() {
+                                    "Usa la app y pulsa Refrescar, o activa Live Watch."
+                                } else {
+                                    "Modifica el archivo y pulsa Recalcular."
+                                })
+                                .size(12.0)
+                                .color(theme::SUBTLE),
+                            );
+                        });
+                        return;
+                    }
+                    egui::ScrollArea::vertical()
+                        .id_salt("diff_scroll")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.spacing_mut().item_spacing.y = 6.0;
+                            for table in &diff.tables {
+                                table_diff(ui, table);
+                            }
+                        });
+                });
+        });
+
+        if !close {
+            self.diff = Some(diff);
+        }
+        if recompute {
+            self.compare_with_baseline();
+        }
+    }
+
     fn central_panel(&mut self, ui: &mut egui::Ui) {
         let frame = Frame::NONE.fill(theme::BG).inner_margin(Margin::same(16));
         egui::CentralPanel::default().frame(frame).show(ui, |ui| {
             if self.db_path.is_none() {
                 self.welcome(ui);
+                return;
+            }
+            if self.diff.is_some() {
+                self.diff_card(ui);
                 return;
             }
             self.editor_card(ui);
@@ -1801,6 +2031,148 @@ fn source_card(ui: &mut egui::Ui, mode: SourceMode, description: &str, active: b
         );
     }
     response.clicked()
+}
+
+/// `+n −n ~n` con los colores de cada tipo de cambio; omite los que son cero.
+fn change_counts(ui: &mut egui::Ui, inserted: u64, deleted: u64, updated: u64) {
+    for (count, sign, color) in [
+        (inserted, "+", theme::SUCCESS),
+        (deleted, "−", theme::DANGER),
+        (updated, "~", theme::WARNING),
+    ] {
+        if count > 0 {
+            ui.label(theme::mono(format!("{sign}{count}")).color(color));
+        }
+    }
+}
+
+/// Una tabla de la comparación: cabecera plegable con sus contadores y, dentro, las filas
+/// insertadas, eliminadas y modificadas.
+fn table_diff(ui: &mut egui::Ui, table: &TableDiff) {
+    let id = ui.make_persistent_id(("diff_table", table.name.as_str()));
+    egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, true)
+        .show_header(ui, |ui| {
+            ui.label(theme::mono(table.name.as_str()).color(theme::TEXT));
+            match table.change {
+                TableChange::Added => {
+                    let bg = theme::SUCCESS.gamma_multiply(0.14);
+                    theme::badge(ui, "nueva", theme::SUCCESS, bg);
+                }
+                TableChange::Removed => {
+                    let bg = theme::DANGER.gamma_multiply(0.14);
+                    theme::badge(ui, "eliminada", theme::DANGER, bg);
+                }
+                TableChange::Modified => {}
+            }
+            if table.schema_changed {
+                theme::badge(ui, "esquema cambiado", theme::WARNING, theme::RAISED)
+                    .on_hover_text("Solo se comparan las columnas que existen en ambas versiones.");
+            }
+            change_counts(
+                ui,
+                table.inserted.count,
+                table.deleted.count,
+                table.updated.count,
+            );
+        })
+        .body(|ui| {
+            ui.spacing_mut().item_spacing.y = 4.0;
+            if table.inserted.count > 0 {
+                diff_section(ui, "Insertadas", theme::SUCCESS, table.inserted.count);
+                let rows = table.inserted.rows.iter().map(|row| (row.as_slice(), None));
+                diff_grid(ui, (&table.name, "ins"), &table.columns, rows);
+            }
+            if table.deleted.count > 0 {
+                diff_section(ui, "Eliminadas", theme::DANGER, table.deleted.count);
+                let rows = table.deleted.rows.iter().map(|row| (row.as_slice(), None));
+                diff_grid(ui, (&table.name, "del"), &table.columns, rows);
+            }
+            if table.updated.count > 0 {
+                diff_section(ui, "Modificadas", theme::WARNING, table.updated.count);
+                let rows = table
+                    .updated
+                    .rows
+                    .iter()
+                    .map(|row| (row.after.as_slice(), Some(row.before.as_slice())));
+                diff_grid(ui, (&table.name, "upd"), &table.columns, rows);
+            }
+        });
+}
+
+fn diff_section(ui: &mut egui::Ui, title: &str, color: Color32, count: u64) {
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        theme::dot(ui, color, 3.5);
+        ui.label(RichText::new(format!("{title} · {count}")).color(theme::TEXT_SOFT));
+        if count > diff::MAX_ROWS as u64 {
+            ui.label(
+                RichText::new(format!("se muestran las primeras {}", diff::MAX_ROWS))
+                    .size(12.0)
+                    .color(theme::SUBTLE),
+            );
+        }
+    });
+}
+
+/// Rejilla de filas. Si una fila trae su versión anterior, las celdas que cambiaron se pintan
+/// como `antes → después` y el resto se atenúa.
+fn diff_grid<'a>(
+    ui: &mut egui::Ui,
+    id: (&str, &str),
+    columns: &[String],
+    rows: impl Iterator<Item = (&'a [Value], Option<&'a [Value]>)>,
+) {
+    egui::ScrollArea::horizontal()
+        .id_salt(("diff_scroll", id))
+        .show(ui, |ui| {
+            egui::Grid::new(("diff_grid", id))
+                .striped(true)
+                .spacing(egui::vec2(16.0, 4.0))
+                .show(ui, |ui| {
+                    for column in columns {
+                        ui.label(
+                            RichText::new(column.as_str())
+                                .family(theme::semibold())
+                                .size(12.0)
+                                .color(theme::MUTED),
+                        );
+                    }
+                    ui.end_row();
+                    for (after, before) in rows {
+                        for (index, value) in after.iter().enumerate() {
+                            match before.map(|before| &before[index]) {
+                                Some(old) if old != value => {
+                                    ui.label(
+                                        theme::mono(format!(
+                                            "{} → {}",
+                                            db::value_display(old),
+                                            db::value_display(value)
+                                        ))
+                                        .color(theme::WARNING),
+                                    );
+                                }
+                                Some(_) => {
+                                    ui.label(
+                                        theme::mono(db::value_display(value)).color(theme::FAINT),
+                                    );
+                                }
+                                None => {
+                                    ui.label(cell_text(value));
+                                }
+                            }
+                        }
+                        ui.end_row();
+                    }
+                });
+        });
+}
+
+fn format_age(elapsed: Duration) -> String {
+    match elapsed.as_secs() {
+        0..=59 => "hace menos de 1 min".to_string(),
+        seconds @ 60..=3599 => format!("hace {} min", seconds / 60),
+        seconds => format!("hace {} h {} min", seconds / 3600, seconds % 3600 / 60),
+    }
 }
 
 /// Índice de la última página de una tabla con `total` filas (0 si está vacía).
