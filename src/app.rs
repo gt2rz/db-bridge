@@ -152,11 +152,23 @@ enum UpdateInstall {
     Failed(String),
 }
 
-pub struct DbBridgeApp {
-    settings: Settings,
+/// Una conexión con su propio origen, consulta, resultados y tareas. Cada pestaña es
+/// independiente: se puede tener un simulador de iOS en una y un emulador Android en otra, o dos
+/// archivos de la misma app.
+struct Tab {
+    /// Identifica la pestaña para que no compartan archivos temporales (línea base).
+    id: u64,
+    mode: SourceMode,
+    /// UDID o serial del dispositivo elegido; vacío para usar el único encendido/conectado.
+    device: String,
+    app_id: String,
+    db_name: String,
     detected_devices: Vec<Device>,
     detected_apps: Vec<String>,
     detected_dbs: Vec<String>,
+    /// El usuario cambió de dispositivo o de app: al detectar sus bases de datos se extrae y
+    /// conecta la elegida sin esperar a «Extraer y conectar».
+    connect_after_detect: bool,
     db_path: Option<PathBuf>,
     /// Origen de la copia local cuando se extrajo de un dispositivo.
     target: Option<MobileTarget>,
@@ -190,22 +202,20 @@ pub struct DbBridgeApp {
     diff: Option<DatabaseDiff>,
     status: String,
     detect_notice: Option<DetectNotice>,
-    /// Instalación en marcha, o por qué no se puede actualizar desde la app.
-    installation: Result<Installation, String>,
-    update_install: Option<UpdateInstall>,
-    new_favorite_name: String,
 }
 
-impl DbBridgeApp {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        let settings = favorites::load();
-        theme::install(&cc.egui_ctx, settings.theme);
-
-        let mut app = Self {
-            settings,
+impl Tab {
+    fn new(ctx: &egui::Context, id: u64, mode: SourceMode) -> Self {
+        Self {
+            id,
+            mode,
+            device: String::new(),
+            app_id: String::new(),
+            db_name: String::new(),
             detected_devices: Vec::new(),
             detected_apps: Vec::new(),
             detected_dbs: Vec::new(),
+            connect_after_detect: false,
             db_path: None,
             target: None,
             origin: None,
@@ -226,11 +236,88 @@ impl DbBridgeApp {
             dirty: false,
             change_revision: 0,
             queued_push: None,
-            tasks: Tasks::new(cc.egui_ctx.clone()),
+            tasks: Tasks::new(ctx.clone()),
             baseline: None,
             diff: None,
             status: "Abre un archivo o extrae la base de datos de un emulador.".to_string(),
             detect_notice: None,
+        }
+    }
+
+    /// Pestaña nueva sin conexión con el mismo dispositivo, app y archivo elegidos que esta, para
+    /// abrir otro archivo de la misma app sin volver a detectarlo todo.
+    fn sibling(&self, ctx: &egui::Context, id: u64) -> Self {
+        let mut tab = Self::new(ctx, id, self.mode);
+        tab.device = self.device.clone();
+        tab.app_id = self.app_id.clone();
+        tab.db_name = self.db_name.clone();
+        tab.detected_devices = self.detected_devices.clone();
+        tab.detected_apps = self.detected_apps.clone();
+        tab.detected_dbs = self.detected_dbs.clone();
+        tab.status = match self.mode {
+            SourceMode::Local => "Abre un archivo SQLite o arrástralo a la ventana.".to_string(),
+            _ => "Elige otro archivo: se extraerá y conectará al momento.".to_string(),
+        };
+        tab
+    }
+
+    /// Texto de la pestaña: plataforma y archivo conectado, o el modo si no hay conexión.
+    fn title(&self) -> String {
+        let platform = match self.mode {
+            SourceMode::Local => "Local",
+            SourceMode::Ios => "iOS",
+            SourceMode::Android => "Android",
+        };
+        match (&self.target, &self.db_path) {
+            (Some(target), Some(_)) => format!("{platform} · {}", last_segment(&target.db_name)),
+            (None, Some(path)) => format!("{platform} · {}", file_name(path)),
+            _ => format!("{platform} · sin conexión"),
+        }
+    }
+
+    /// Cerrarla perdería cambios sin enviar o cortaría una transferencia.
+    fn has_pending_work(&self) -> bool {
+        self.dirty || self.tasks.is_running(TaskKind::Pull) || self.tasks.is_running(TaskKind::Push)
+    }
+}
+
+pub struct DbBridgeApp {
+    settings: Settings,
+    /// Pestaña activa. Su hueco en `tabs` guarda una vacía hasta que se cambia a otra.
+    tab: Tab,
+    tabs: Vec<Tab>,
+    active: usize,
+    next_tab_id: u64,
+    /// Pestaña con trabajo pendiente cuyo cierre espera confirmación.
+    pending_close: Option<usize>,
+    ctx: egui::Context,
+    /// Búsqueda e instalación de actualizaciones: no pertenecen a ninguna pestaña.
+    tasks: Tasks<TaskOutput>,
+    /// Instalación en marcha, o por qué no se puede actualizar desde la app.
+    installation: Result<Installation, String>,
+    update_install: Option<UpdateInstall>,
+    new_favorite_name: String,
+}
+
+impl DbBridgeApp {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let settings = favorites::load();
+        theme::install(&cc.egui_ctx, settings.theme);
+
+        // La primera pestaña recupera la última selección guardada.
+        let mut tab = Tab::new(&cc.egui_ctx, 0, settings.mode);
+        tab.device = settings.device.clone();
+        tab.app_id = settings.app_id.clone();
+        tab.db_name = settings.db_name.clone();
+        let mut app = Self {
+            settings,
+            tabs: vec![Tab::new(&cc.egui_ctx, 0, SourceMode::Local)],
+            tab,
+            active: 0,
+            next_tab_id: 1,
+            pending_close: None,
+            ctx: cc.egui_ctx.clone(),
+            tasks: Tasks::new(cc.egui_ctx.clone()),
             installation: Installation::current().map_err(|error| format!("{error:#}")),
             update_install: None,
             new_favorite_name: String::new(),
@@ -239,20 +326,186 @@ impl DbBridgeApp {
         app
     }
 
+    /// Abre una pestaña junto a la activa con su misma selección y pasa a ella.
+    fn new_tab(&mut self) {
+        let tab = self.tab.sibling(&self.ctx, self.next_tab_id);
+        self.next_tab_id += 1;
+        let index = self.active + 1;
+        self.tabs.insert(index, tab);
+        self.switch_tab(index);
+        if self.tab.mode != SourceMode::Local && self.tab.detected_devices.is_empty() {
+            self.detect_devices(false);
+        }
+    }
+
+    fn switch_tab(&mut self, index: usize) {
+        if index == self.active || index >= self.tabs.len() {
+            return;
+        }
+        std::mem::swap(&mut self.tab, &mut self.tabs[self.active]);
+        std::mem::swap(&mut self.tab, &mut self.tabs[index]);
+        self.active = index;
+        // Con Live Watch activo, la pestaña a la que se vuelve se refresca al momento.
+        let interval = Duration::from_secs(self.settings.live_watch_secs);
+        if let Some(due) = Instant::now().checked_sub(interval) {
+            self.tab.last_refresh = due;
+        }
+        self.persist();
+    }
+
+    /// Cierra la pestaña o pide confirmación si tiene cambios sin enviar o una transferencia.
+    fn request_close_tab(&mut self, index: usize) {
+        if self.tab_at(index).has_pending_work() {
+            self.pending_close = Some(index);
+        } else {
+            self.close_tab(index);
+        }
+    }
+
+    fn close_tab(&mut self, index: usize) {
+        if self.tabs.len() == 1 {
+            // La última no se quita: se sustituye por una vacía del mismo modo.
+            self.tab = Tab::new(&self.ctx, self.next_tab_id, self.tab.mode);
+            self.next_tab_id += 1;
+            return;
+        }
+        if index == self.active {
+            let next = if index + 1 < self.tabs.len() {
+                index + 1
+            } else {
+                index - 1
+            };
+            self.switch_tab(next);
+        }
+        self.tabs.remove(index);
+        if index < self.active {
+            self.active -= 1;
+        }
+    }
+
+    /// Ejecuta `job` con la pestaña `index` como activa, para terminar en ella las tareas que
+    /// lanzó aunque se esté viendo otra.
+    fn on_tab(&mut self, index: usize, job: impl FnOnce(&mut Self)) {
+        if index == self.active {
+            job(self);
+            return;
+        }
+        std::mem::swap(&mut self.tab, &mut self.tabs[index]);
+        job(self);
+        std::mem::swap(&mut self.tab, &mut self.tabs[index]);
+    }
+
+    fn tab_at(&self, index: usize) -> &Tab {
+        if index == self.active {
+            &self.tab
+        } else {
+            &self.tabs[index]
+        }
+    }
+
+    fn tab_bar(&mut self, ui: &mut egui::Ui) {
+        let frame = Frame::NONE
+            .fill(theme::sidebar())
+            .inner_margin(Margin::symmetric(12, 4));
+        let mut switch_to = None;
+        let mut close = None;
+        let mut open = false;
+        egui::Panel::top("tab_bar").frame(frame).show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                for index in 0..self.tabs.len() {
+                    let tab = self.tab_at(index);
+                    let active = index == self.active;
+                    let busy = tab.tasks.running().next().is_some();
+                    let color = if active {
+                        theme::text()
+                    } else {
+                        theme::text_soft()
+                    };
+                    let mut hover = tab
+                        .origin
+                        .clone()
+                        .unwrap_or_else(|| tab.mode.label().into());
+                    if let Some(target) = &tab.target {
+                        let device = tab
+                            .detected_devices
+                            .iter()
+                            .find(|device| device.id == target.device)
+                            .map_or(target.device.as_str(), |device| device.name.as_str());
+                        if !device.is_empty() {
+                            hover.push_str(&format!("\n{device}"));
+                        }
+                    }
+                    if tab.dirty {
+                        hover.push_str("\nCambios sin push");
+                    }
+                    ui.horizontal(|ui| {
+                        if busy {
+                            ui.add(egui::Spinner::new().size(10.0).color(theme::accent()));
+                        } else if tab.dirty {
+                            theme::dot(ui, theme::warning(), 3.0);
+                        }
+                        let button = egui::Button::selectable(
+                            active,
+                            RichText::new(tab.title()).size(12.5).color(color),
+                        )
+                        .min_size(egui::vec2(0.0, 26.0));
+                        if ui.add(button).on_hover_text(hover).clicked() {
+                            switch_to = Some(index);
+                        }
+                        let cross =
+                            egui::Button::new(RichText::new("×").size(14.0).color(theme::subtle()))
+                                .frame_when_inactive(false)
+                                .min_size(egui::vec2(22.0, 22.0));
+                        if ui.add(cross).on_hover_text("Cerrar pestaña").clicked() {
+                            close = Some(index);
+                        }
+                    });
+                    ui.add_space(6.0);
+                }
+                let add = egui::Button::new(RichText::new("+").size(15.0).color(theme::muted()))
+                    .frame_when_inactive(false)
+                    .min_size(egui::vec2(26.0, 26.0));
+                open = ui
+                    .add(add)
+                    .on_hover_text(
+                        "Nueva pestaña con el mismo dispositivo y app: elige otro archivo, \
+                         dispositivo o modo sin perder esta conexión.",
+                    )
+                    .clicked();
+            });
+        });
+        if let Some(index) = switch_to {
+            self.switch_tab(index);
+        }
+        if let Some(index) = close {
+            self.request_close_tab(index);
+        }
+        if open {
+            self.new_tab();
+        }
+    }
+
     fn persist(&mut self) {
+        // Al volver a abrir la app, la primera pestaña recupera la última selección.
+        self.settings.mode = self.tab.mode;
+        self.settings.device = self.tab.device.clone();
+        self.settings.app_id = self.tab.app_id.clone();
+        self.settings.db_name = self.tab.db_name.clone();
         if let Err(error) = favorites::save(&self.settings) {
-            self.status = format!("No se pudieron guardar los ajustes: {error:#}");
+            self.tab.status = format!("No se pudieron guardar los ajustes: {error:#}");
         }
     }
 
     /// Lista los dispositivos y, si hay alguno, sigue con sus apps y sus bases de datos.
     fn detect_devices(&mut self, fallback: bool) {
-        let mode = self.settings.mode;
+        let mode = self.tab.mode;
         if mode == SourceMode::Local {
             return;
         }
-        self.detect_notice = None;
-        self.tasks.spawn(TaskKind::DetectDevices, move || {
+        self.tab.detect_notice = None;
+        self.tab.connect_after_detect = false;
+        self.tab.tasks.spawn(TaskKind::DetectDevices, move || {
             let result = mobile::detect_devices(mode);
             let found = result.as_ref().is_ok_and(|devices| !devices.is_empty());
             let elsewhere = other_mobile_mode(mode).filter(|other| {
@@ -269,21 +522,21 @@ impl DbBridgeApp {
 
     /// Deja la detección sin resultado a la vista: en la barra de estado y junto a «Detectar».
     fn detect_failed(&mut self, message: String, switch_to: Option<SourceMode>) {
-        self.status = message.clone();
-        self.detect_notice = Some(DetectNotice { message, switch_to });
+        self.tab.status = message.clone();
+        self.tab.detect_notice = Some(DetectNotice { message, switch_to });
     }
 
     fn change_mode(&mut self, mode: SourceMode) {
-        self.settings.mode = mode;
-        self.detected_devices.clear();
-        self.detected_apps.clear();
-        self.detected_dbs.clear();
-        self.detect_notice = None;
-        self.editing = None;
+        self.tab.mode = mode;
+        self.tab.detected_devices.clear();
+        self.tab.detected_apps.clear();
+        self.tab.detected_dbs.clear();
+        self.tab.detect_notice = None;
+        self.tab.editing = None;
         if mode == SourceMode::Local {
-            self.status = "Abre un archivo SQLite o arrástralo a la ventana.".to_string();
+            self.tab.status = "Abre un archivo SQLite o arrástralo a la ventana.".to_string();
         } else {
-            self.status = format!("{}: buscando dispositivos…", mode.label());
+            self.tab.status = format!("{}: buscando dispositivos…", mode.label());
             self.detect_devices(false);
         }
         self.persist();
@@ -296,7 +549,7 @@ impl DbBridgeApp {
         result: anyhow::Result<Vec<Device>>,
         elsewhere: Option<SourceMode>,
     ) {
-        if mode != self.settings.mode {
+        if mode != self.tab.mode {
             return;
         }
         let hint = match elsewhere {
@@ -306,9 +559,9 @@ impl DbBridgeApp {
         };
         match result {
             Ok(devices) if devices.is_empty() => {
-                self.detected_devices.clear();
-                self.detected_apps.clear();
-                self.detected_dbs.clear();
+                self.tab.detected_devices.clear();
+                self.tab.detected_apps.clear();
+                self.tab.detected_dbs.clear();
                 let message = match mode {
                     SourceMode::Ios => "No hay ningún simulador de iOS encendido.",
                     _ => "No hay ningún dispositivo o emulador conectado a adb.",
@@ -317,20 +570,17 @@ impl DbBridgeApp {
             }
             Ok(devices) => {
                 // Se conserva el elegido si sigue conectado; si no, el primero de la lista.
-                if !devices
-                    .iter()
-                    .any(|device| device.id == self.settings.device)
-                {
-                    self.settings.device = devices[0].id.clone();
-                    self.detected_apps.clear();
-                    self.detected_dbs.clear();
+                if !devices.iter().any(|device| device.id == self.tab.device) {
+                    self.tab.device = devices[0].id.clone();
+                    self.tab.detected_apps.clear();
+                    self.tab.detected_dbs.clear();
                     self.persist();
                 }
-                self.detected_devices = devices;
+                self.tab.detected_devices = devices;
                 self.detect_apps(fallback);
             }
             Err(error) => {
-                self.detected_devices.clear();
+                self.tab.detected_devices.clear();
                 self.detect_failed(
                     format!("No se pudieron listar los dispositivos: {error:#}.{hint}"),
                     elsewhere,
@@ -340,23 +590,24 @@ impl DbBridgeApp {
     }
 
     fn select_device(&mut self, device: String) {
-        if device == self.settings.device {
+        if device == self.tab.device {
             return;
         }
-        self.settings.device = device;
-        self.detected_apps.clear();
-        self.detected_dbs.clear();
+        self.tab.device = device;
+        self.tab.detected_apps.clear();
+        self.tab.detected_dbs.clear();
+        self.tab.connect_after_detect = true;
         self.persist();
         self.detect_apps(true);
     }
 
     fn detect_apps(&mut self, fallback: bool) {
-        let mode = self.settings.mode;
+        let mode = self.tab.mode;
         if mode == SourceMode::Local {
             return;
         }
-        let device = self.settings.device.clone();
-        self.tasks.spawn(TaskKind::DetectApps, move || {
+        let device = self.tab.device.clone();
+        self.tab.tasks.spawn(TaskKind::DetectApps, move || {
             let result = mobile::detect_apps(mode, &device);
             TaskOutput::Apps {
                 mode,
@@ -374,7 +625,7 @@ impl DbBridgeApp {
         fallback: bool,
         result: anyhow::Result<Vec<String>>,
     ) {
-        if mode != self.settings.mode || device != self.settings.device {
+        if mode != self.tab.mode || device != self.tab.device {
             return;
         }
         let mut found_apps = false;
@@ -387,34 +638,37 @@ impl DbBridgeApp {
                         None,
                     );
                 } else {
-                    if self.settings.app_id.trim().is_empty()
-                        || !apps.iter().any(|app| app == self.settings.app_id.trim())
+                    if self.tab.app_id.trim().is_empty()
+                        || !apps.iter().any(|app| app == self.tab.app_id.trim())
                     {
-                        self.settings.app_id = apps[0].clone();
+                        self.tab.app_id = apps[0].clone();
                     }
-                    self.status = format!("{} aplicaciones detectadas.", apps.len());
+                    self.tab.status = format!("{} aplicaciones detectadas.", apps.len());
                 }
                 found_apps = !apps.is_empty();
-                self.detected_apps = apps;
+                self.tab.detected_apps = apps;
             }
             Err(error) => {
                 self.detect_failed(format!("No se pudieron detectar apps: {error:#}"), None);
             }
         }
-        if found_apps || (fallback && self.detected_apps.is_empty()) {
+        if found_apps || (fallback && self.tab.detected_apps.is_empty()) {
             self.detect_databases();
+        } else {
+            self.tab.connect_after_detect = false;
         }
     }
 
     fn detect_databases(&mut self) {
-        let mode = self.settings.mode;
-        let device = self.settings.device.clone();
-        let app_id = self.settings.app_id.trim().to_string();
+        let mode = self.tab.mode;
+        let device = self.tab.device.clone();
+        let app_id = self.tab.app_id.trim().to_string();
         if mode == SourceMode::Local || app_id.is_empty() {
-            self.detected_dbs.clear();
+            self.tab.detected_dbs.clear();
+            self.tab.connect_after_detect = false;
             return;
         }
-        self.tasks.spawn(TaskKind::DetectDatabases, move || {
+        self.tab.tasks.spawn(TaskKind::DetectDatabases, move || {
             let result = mobile::detect_databases(mode, &device, &app_id);
             TaskOutput::Databases {
                 mode,
@@ -433,10 +687,7 @@ impl DbBridgeApp {
         result: anyhow::Result<Vec<String>>,
     ) {
         // El usuario cambió de modo, de dispositivo o de app mientras se buscaba.
-        if mode != self.settings.mode
-            || device != self.settings.device
-            || app_id != self.settings.app_id.trim()
-        {
+        if mode != self.tab.mode || device != self.tab.device || app_id != self.tab.app_id.trim() {
             return;
         }
         match result {
@@ -450,29 +701,44 @@ impl DbBridgeApp {
                     );
                 } else {
                     // Un nombre guardado de antes («offline.db») se traduce a su ruta detectada.
-                    let current = self.settings.db_name.trim();
+                    let current = self.tab.db_name.trim();
                     let matching = databases
                         .iter()
                         .find(|path| {
                             path.as_str() == current || path.ends_with(&format!("/{current}"))
                         })
                         .cloned();
-                    self.settings.db_name = matching.unwrap_or_else(|| databases[0].clone());
-                    self.status = format!(
+                    self.tab.db_name = matching.unwrap_or_else(|| databases[0].clone());
+                    self.tab.status = format!(
                         "{} bases de datos encontradas en {app_id}.",
                         databases.len()
                     );
                 }
-                self.detected_dbs = databases;
+                self.tab.detected_dbs = databases;
             }
             Err(error) => {
-                self.detected_dbs.clear();
+                self.tab.detected_dbs.clear();
                 self.detect_failed(
                     format!("No se pudieron detectar bases de datos: {error:#}"),
                     None,
                 );
             }
         }
+        if std::mem::take(&mut self.tab.connect_after_detect) && !self.tab.detected_dbs.is_empty() {
+            self.connect_selection();
+        }
+    }
+
+    /// Se eligió otro archivo, app o dispositivo en los selectores: se extrae y conecta al
+    /// momento. Con cambios sin enviar no, porque la reconexión los dejaría sin push.
+    fn connect_selection(&mut self) {
+        if self.tab.dirty {
+            self.tab.status = "Hay cambios sin push: envíalos o pulsa «Extraer y conectar» para \
+                               descartarlos y abrir el archivo elegido."
+                .to_string();
+            return;
+        }
+        self.pull_selected();
     }
 
     fn pick_local_file(&mut self) {
@@ -485,13 +751,13 @@ impl DbBridgeApp {
     }
 
     fn open_local(&mut self, path: PathBuf) {
-        self.settings.mode = SourceMode::Local;
-        self.detected_devices.clear();
-        self.detected_apps.clear();
-        self.detected_dbs.clear();
+        self.tab.mode = SourceMode::Local;
+        self.tab.detected_devices.clear();
+        self.tab.detected_apps.clear();
+        self.tab.detected_dbs.clear();
         let origin = file_name(&path);
         if self.connect(path.clone(), origin) {
-            self.target = None;
+            self.tab.target = None;
             self.remember_recent(RecentSource {
                 mode: SourceMode::Local,
                 device: String::new(),
@@ -509,20 +775,20 @@ impl DbBridgeApp {
                 if path.exists() {
                     self.open_local(path);
                 } else {
-                    self.status = format!("No se encontró {}", path.display());
+                    self.tab.status = format!("No se encontró {}", path.display());
                 }
             }
             None => {
-                self.settings.mode = recent.mode;
+                self.tab.mode = recent.mode;
                 // Los recientes guardados antes del selector no tienen dispositivo.
                 if !recent.device.is_empty() {
-                    self.settings.device = recent.device;
+                    self.tab.device = recent.device;
                 }
-                self.settings.app_id = recent.app_id;
-                self.settings.db_name = recent.db_name;
-                self.detected_devices.clear();
-                self.detected_apps.clear();
-                self.detected_dbs.clear();
+                self.tab.app_id = recent.app_id;
+                self.tab.db_name = recent.db_name;
+                self.tab.detected_devices.clear();
+                self.tab.detected_apps.clear();
+                self.tab.detected_dbs.clear();
                 self.pull_selected();
             }
         }
@@ -536,26 +802,26 @@ impl DbBridgeApp {
 
     /// Pull y push leen y escriben la copia local y el dispositivo: nunca dos a la vez.
     fn transfer_running(&self) -> bool {
-        self.tasks.is_running(TaskKind::Pull) || self.tasks.is_running(TaskKind::Push)
+        self.tab.tasks.is_running(TaskKind::Pull) || self.tab.tasks.is_running(TaskKind::Push)
     }
 
     /// Extrae la base de datos elegida en los selectores.
     fn pull_selected(&mut self) {
-        let mode = self.settings.mode;
+        let mode = self.tab.mode;
         if mode == SourceMode::Local {
             return;
         }
-        let app_id = self.settings.app_id.trim().to_string();
-        let db_name = self.settings.db_name.trim().to_string();
+        let app_id = self.tab.app_id.trim().to_string();
+        let db_name = self.tab.db_name.trim().to_string();
         if app_id.is_empty() || db_name.is_empty() {
-            self.status =
+            self.tab.status =
                 "Indica el identificador de la app y el nombre del archivo de base de datos."
                     .to_string();
             return;
         }
         self.pull_mobile(MobileTarget {
             mode,
-            device: self.settings.device.clone(),
+            device: self.tab.device.clone(),
             app_id,
             db_name,
         });
@@ -563,10 +829,10 @@ impl DbBridgeApp {
 
     fn pull_mobile(&mut self, target: MobileTarget) {
         if self.transfer_running() {
-            self.status = "Espera a que termine la transferencia en curso.".to_string();
+            self.tab.status = "Espera a que termine la transferencia en curso.".to_string();
             return;
         }
-        self.tasks.spawn(TaskKind::Pull, move || {
+        self.tab.tasks.spawn(TaskKind::Pull, move || {
             let result = mobile::pull(target.mode, &target.device, &target.app_id, &target.db_name);
             TaskOutput::Pulled { target, result }
         });
@@ -574,7 +840,7 @@ impl DbBridgeApp {
 
     fn finish_pull(&mut self, target: MobileTarget, result: anyhow::Result<PathBuf>) {
         // Se pasó a archivo local u otro modo mientras se extraía.
-        if target.mode != self.settings.mode {
+        if target.mode != self.tab.mode {
             return;
         }
         match result {
@@ -588,12 +854,12 @@ impl DbBridgeApp {
                         db_name: target.db_name.clone(),
                         path: None,
                     });
-                    self.target = Some(target);
+                    self.tab.target = Some(target);
                 }
                 self.persist();
             }
             Err(error) => {
-                self.status = format!("Error extrayendo la base de datos: {error:#}");
+                self.tab.status = format!("Error extrayendo la base de datos: {error:#}");
             }
         }
     }
@@ -601,41 +867,44 @@ impl DbBridgeApp {
     /// Envía la copia local al dispositivo en segundo plano. `message` describe el cambio que
     /// lo motivó, si lo hay, para el texto de la barra de estado.
     fn push_mobile(&mut self, message: Option<String>) {
-        let (Some(local), Some(target)) = (self.db_path.clone(), self.target.clone()) else {
+        let (Some(local), Some(target)) = (self.tab.db_path.clone(), self.tab.target.clone())
+        else {
             return;
         };
-        if self.tasks.is_running(TaskKind::Pull) {
-            self.status = "Espera a que termine la extracción en curso.".to_string();
+        if self.tab.tasks.is_running(TaskKind::Pull) {
+            self.tab.status = "Espera a que termine la extracción en curso.".to_string();
             return;
         }
-        if self.tasks.is_running(TaskKind::Push) {
+        if self.tab.tasks.is_running(TaskKind::Push) {
             // El push siguiente lleva todos los cambios acumulados: basta con recordar el último.
             let message = message.unwrap_or_default();
-            self.status = format!("{message} En cola para enviar al dispositivo.")
+            self.tab.status = format!("{message} En cola para enviar al dispositivo.")
                 .trim_start()
                 .to_string();
-            self.queued_push = Some(message);
+            self.tab.queued_push = Some(message);
             return;
         }
 
         if let Err(error) = db::checkpoint(&local) {
-            self.status = format!("Error preparando la base de datos para el push: {error:#}");
+            self.tab.status = format!("Error preparando la base de datos para el push: {error:#}");
             return;
         }
         let snapshot = match mobile::push_snapshot(&local) {
             Ok(snapshot) => snapshot,
             Err(error) => {
-                self.status = format!("Error preparando la base de datos para el push: {error:#}");
+                self.tab.status =
+                    format!("Error preparando la base de datos para el push: {error:#}");
                 return;
             }
         };
 
-        let revision = self.change_revision;
-        self.status = match &message {
+        let revision = self.tab.change_revision;
+        self.tab.status = match &message {
             Some(message) => format!("{message} Enviando al dispositivo…"),
             None => "Enviando al dispositivo…".to_string(),
         };
-        self.tasks
+        self.tab
+            .tasks
             .spawn(TaskKind::Push, move || TaskOutput::Pushed {
                 revision,
                 message,
@@ -652,10 +921,10 @@ impl DbBridgeApp {
     fn finish_push(&mut self, revision: u64, message: Option<String>, result: anyhow::Result<()>) {
         match result {
             Ok(()) => {
-                if revision == self.change_revision {
-                    self.dirty = false;
+                if revision == self.tab.change_revision {
+                    self.tab.dirty = false;
                 }
-                self.status = match message {
+                self.tab.status = match message {
                     Some(message) => {
                         format!("{message} Enviado al dispositivo: reabre la app para verlo.")
                     }
@@ -664,15 +933,29 @@ impl DbBridgeApp {
                 };
             }
             // El cambio sigue pendiente («Cambios sin push») y el error queda en la barra.
-            Err(error) => self.status = format!("Error enviando la base de datos: {error:#}"),
+            Err(error) => self.tab.status = format!("Error enviando la base de datos: {error:#}"),
         }
-        if let Some(message) = self.queued_push.take() {
+        if let Some(message) = self.tab.queued_push.take() {
             self.push_mobile((!message.is_empty()).then_some(message));
         }
     }
 
+    /// Recoge las tareas terminadas de todas las pestañas, cada una en su propia pestaña.
     fn poll_tasks(&mut self) {
         for (kind, output) in self.tasks.finished() {
+            self.finish_task(kind, output);
+        }
+        for index in 0..self.tabs.len() {
+            self.on_tab(index, |app| {
+                for (kind, output) in app.tab.tasks.finished() {
+                    app.finish_task(kind, output);
+                }
+            });
+        }
+    }
+
+    fn finish_task(&mut self, kind: TaskKind, output: Option<TaskOutput>) {
+        {
             match output {
                 Some(TaskOutput::Devices {
                     mode,
@@ -703,7 +986,8 @@ impl DbBridgeApp {
                     self.finish_install_update(version, result);
                 }
                 None => {
-                    self.status = format!("Error inesperado: «{}» se interrumpió.", kind.label());
+                    self.tab.status =
+                        format!("Error inesperado: «{}» se interrumpió.", kind.label());
                 }
             }
         }
@@ -713,17 +997,17 @@ impl DbBridgeApp {
     /// en el origen; con un dispositivo se envía al momento si el push automático está activo.
     fn record_change(&mut self, message: String) {
         // Puede ser DDL (ALTER, CREATE INDEX…): el esquema se vuelve a leer al mostrarlo.
-        self.schema = None;
-        if self.target.is_none() || self.db_path.is_none() {
-            self.status = message;
+        self.tab.schema = None;
+        if self.tab.target.is_none() || self.tab.db_path.is_none() {
+            self.tab.status = message;
             return;
         }
-        self.dirty = true;
-        self.change_revision += 1;
+        self.tab.dirty = true;
+        self.tab.change_revision += 1;
         if self.settings.auto_push {
             self.push_mobile(Some(message));
         } else {
-            self.status = format!("{message} Pulsa «Push al emulador» para enviarlo.");
+            self.tab.status = format!("{message} Pulsa «Push al emulador» para enviarlo.");
         }
     }
 
@@ -731,7 +1015,7 @@ impl DbBridgeApp {
         let conn = match db::open(&path) {
             Ok(conn) => conn,
             Err(error) => {
-                self.status = format!("Error abriendo SQLite: {error:#}");
+                self.tab.status = format!("Error abriendo SQLite: {error:#}");
                 return false;
             }
         };
@@ -739,138 +1023,140 @@ impl DbBridgeApp {
         let objects = match db::list_objects(&conn) {
             Ok(objects) => objects,
             Err(error) => {
-                self.status = format!("Error leyendo el esquema: {error:#}");
+                self.tab.status = format!("Error leyendo el esquema: {error:#}");
                 return false;
             }
         };
 
-        self.db_path = Some(path);
-        self.objects = objects;
-        self.editing = None;
-        self.dirty = false;
-        self.schema = None;
+        self.tab.db_path = Some(path);
+        self.tab.objects = objects;
+        self.tab.editing = None;
+        self.tab.dirty = false;
+        self.tab.schema = None;
         // Un push en cola era para la copia anterior.
-        self.queued_push = None;
-        if self.sql.trim().is_empty() {
-            self.sql = DEFAULT_SQL.to_string();
-            self.generated_sql = None;
+        self.tab.queued_push = None;
+        if self.tab.sql.trim().is_empty() {
+            self.tab.sql = DEFAULT_SQL.to_string();
+            self.tab.generated_sql = None;
         }
-        self.status = format!("Conectado: {origin}");
-        self.origin = Some(origin);
+        self.tab.status = format!("Conectado: {origin}");
+        self.tab.origin = Some(origin);
         if self
+            .tab
             .baseline
             .as_ref()
-            .is_some_and(|baseline| Some(&baseline.source) != self.db_path.as_ref())
+            .is_some_and(|baseline| Some(&baseline.source) != self.tab.db_path.as_ref())
         {
-            self.baseline = None;
-            self.diff = None;
-        } else if self.diff.is_some() {
+            self.tab.baseline = None;
+            self.tab.diff = None;
+        } else if self.tab.diff.is_some() {
             // Live Watch o Refrescar: la vista de cambios se mantiene al día.
             self.compare_with_baseline();
         }
         // Reconectar (Live Watch, Refrescar) no debe repetir un DELETE o UPDATE del editor.
-        if db::is_read_only(&conn, &self.sql) {
+        if db::is_read_only(&conn, &self.tab.sql) {
             self.run_sql();
         } else {
-            self.result = QueryResult::default();
+            self.tab.result = QueryResult::default();
         }
         true
     }
 
     fn set_baseline(&mut self) {
-        let Some(source) = self.db_path.clone() else {
+        let Some(source) = self.tab.db_path.clone() else {
             return;
         };
-        if self.tasks.is_running(TaskKind::Pull) {
-            self.status = "Espera a que termine la extracción en curso.".to_string();
+        if self.tab.tasks.is_running(TaskKind::Pull) {
+            self.tab.status = "Espera a que termine la extracción en curso.".to_string();
             return;
         }
         let copy = std::env::temp_dir()
             .join("db-bridge")
             .join("baseline")
             .join(std::process::id().to_string())
+            .join(self.tab.id.to_string())
             .join(source.file_name().unwrap_or_default());
         match diff::snapshot(&source, &copy) {
             Ok(()) => {
-                self.baseline = Some(Baseline {
+                self.tab.baseline = Some(Baseline {
                     source,
                     copy,
                     taken_at: Instant::now(),
                 });
-                self.status = if self.target.is_some() {
+                self.tab.status = if self.tab.target.is_some() {
                     "Línea base fijada. Usa la app: los cambios aparecerán en «Ver cambios» con Live Watch o al pulsar Refrescar."
                 } else {
                     "Línea base fijada. Los cambios en el archivo aparecerán en «Ver cambios»."
                 }
                 .to_string();
-                if self.diff.is_some() {
+                if self.tab.diff.is_some() {
                     self.compare_with_baseline();
                 }
             }
-            Err(error) => self.status = format!("No se pudo fijar la línea base: {error:#}"),
+            Err(error) => self.tab.status = format!("No se pudo fijar la línea base: {error:#}"),
         }
     }
 
     fn compare_with_baseline(&mut self) {
-        let (Some(current), Some(baseline)) = (&self.db_path, &self.baseline) else {
+        let (Some(current), Some(baseline)) = (&self.tab.db_path, &self.tab.baseline) else {
             return;
         };
         match diff::compare(current, &baseline.copy) {
             Ok(result) => {
-                self.editing = None;
-                self.diff = Some(result);
+                self.tab.editing = None;
+                self.tab.diff = Some(result);
             }
             Err(error) => {
-                self.diff = None;
-                self.status = format!("No se pudo comparar con la línea base: {error:#}");
+                self.tab.diff = None;
+                self.tab.status = format!("No se pudo comparar con la línea base: {error:#}");
             }
         }
     }
 
     fn clear_baseline(&mut self) {
-        self.baseline = None;
-        self.diff = None;
-        self.status = "Línea base descartada.".to_string();
+        self.tab.baseline = None;
+        self.tab.diff = None;
+        self.tab.status = "Línea base descartada.".to_string();
     }
 
     fn select_object(&mut self, object: DbObject) {
-        self.selected = Some(object);
-        self.diff = None;
-        self.view = db::TableView::default();
+        self.tab.selected = Some(object);
+        self.tab.diff = None;
+        self.tab.view = db::TableView::default();
         self.go_to_page(0);
     }
 
     fn go_to_page(&mut self, page: usize) {
-        self.view.page = page;
+        self.tab.view.page = page;
         self.load_view();
     }
 
     /// Clic en la cabecera de una columna: ascendente → descendente → sin orden.
     fn toggle_sort(&mut self, column: &str) {
-        self.view.sort = match &self.view.sort {
+        self.tab.view.sort = match &self.tab.view.sort {
             Some((current, false)) if current == column => Some((column.to_string(), true)),
             Some((current, true)) if current == column => None,
             _ => Some((column.to_string(), false)),
         };
-        self.view.page = 0;
+        self.tab.view.page = 0;
         self.load_view();
     }
 
     /// Ejecuta la consulta de la vista de tabla actual y la muestra en el editor.
     fn load_view(&mut self) {
-        let (Some(object), Some(path)) = (&self.selected, &self.db_path) else {
+        let (Some(object), Some(path)) = (&self.tab.selected, &self.tab.db_path) else {
             return;
         };
         if let Ok(conn) = db::open(path) {
-            self.sql = db::table_page_sql(&conn, object, &self.view);
+            self.tab.sql = db::table_page_sql(&conn, object, &self.tab.view);
         }
-        self.generated_sql = Some(self.sql.clone());
-        self.editing = None;
+        self.tab.generated_sql = Some(self.tab.sql.clone());
+        self.tab.editing = None;
         self.run_sql();
     }
 
     fn remember_query(&mut self) {
-        let sql = self.sql.trim().to_string();
+        let sql = self.tab.sql.trim().to_string();
         if sql.is_empty() || sql == DEFAULT_SQL {
             return;
         }
@@ -885,42 +1171,43 @@ impl DbBridgeApp {
     }
 
     fn explain(&mut self) {
-        let Some(path) = self.db_path.clone() else {
+        let Some(path) = self.tab.db_path.clone() else {
             return;
         };
-        if self.tasks.is_running(TaskKind::Pull) {
-            self.status = "Espera a que termine la extracción en curso.".to_string();
+        if self.tab.tasks.is_running(TaskKind::Pull) {
+            self.tab.status = "Espera a que termine la extracción en curso.".to_string();
             return;
         }
-        match db::open(&path).and_then(|conn| db::query_plan(&conn, &self.sql)) {
+        match db::open(&path).and_then(|conn| db::query_plan(&conn, &self.tab.sql)) {
             Ok(plan) => {
-                self.status = format!("Plan de consulta · {} pasos", plan.rows.len());
-                self.result = plan;
-                self.results_tab = ResultsTab::Data;
-                self.editing = None;
+                self.tab.status = format!("Plan de consulta · {} pasos", plan.rows.len());
+                self.tab.result = plan;
+                self.tab.results_tab = ResultsTab::Data;
+                self.tab.editing = None;
             }
-            Err(error) => self.status = format!("Error SQL: {error:#}"),
+            Err(error) => self.tab.status = format!("Error SQL: {error:#}"),
         }
     }
 
     fn refresh(&mut self) {
-        if self.db_path.is_none() {
-            self.status = "No hay ninguna base de datos conectada.".to_string();
+        if self.tab.db_path.is_none() {
+            self.tab.status = "No hay ninguna base de datos conectada.".to_string();
             return;
         }
-        match self.target.clone() {
+        match self.tab.target.clone() {
             Some(target) => self.pull_mobile(target),
             None => {
                 let read_only = self
+                    .tab
                     .db_path
                     .as_ref()
                     .and_then(|path| db::open(path).ok())
-                    .map(|conn| db::is_read_only(&conn, &self.sql))
+                    .map(|conn| db::is_read_only(&conn, &self.tab.sql))
                     .unwrap_or(true);
                 if read_only {
                     self.run_sql();
                 } else {
-                    self.status =
+                    self.tab.status =
                         "La consulta del editor modifica datos: pulsa Ejecutar para repetirla."
                             .to_string();
                 }
@@ -929,37 +1216,39 @@ impl DbBridgeApp {
     }
 
     fn run_sql(&mut self) {
-        let Some(path) = self.db_path.clone() else {
-            self.status = "No hay ninguna base de datos conectada.".to_string();
+        let Some(path) = self.tab.db_path.clone() else {
+            self.tab.status = "No hay ninguna base de datos conectada.".to_string();
             return;
         };
         // La copia local se está sobrescribiendo: se ejecutará al conectar si es de lectura.
-        if self.tasks.is_running(TaskKind::Pull) {
-            self.status = "Espera a que termine la extracción en curso.".to_string();
+        if self.tab.tasks.is_running(TaskKind::Pull) {
+            self.tab.status = "Espera a que termine la extracción en curso.".to_string();
             return;
         }
 
         let conn = match db::open(&path) {
             Ok(conn) => conn,
             Err(error) => {
-                self.status = format!("Error abriendo la base de datos: {error:#}");
+                self.tab.status = format!("Error abriendo la base de datos: {error:#}");
                 return;
             }
         };
 
         let is_generated = self
+            .tab
             .generated_sql
             .as_ref()
-            .map(|generated| generated.trim() == self.sql.trim())
+            .map(|generated| generated.trim() == self.tab.sql.trim())
             .unwrap_or(false);
 
         let outcome = if is_generated {
-            self.selected
+            self.tab
+                .selected
                 .as_ref()
-                .map(|object| db::run_table_query(&conn, object, db::ROW_LIMIT, &self.view))
-                .unwrap_or_else(|| db::run_script(&conn, &self.sql))
+                .map(|object| db::run_table_query(&conn, object, db::ROW_LIMIT, &self.tab.view))
+                .unwrap_or_else(|| db::run_script(&conn, &self.tab.sql))
         } else {
-            db::run_script(&conn, &self.sql)
+            db::run_script(&conn, &self.tab.sql)
         };
         drop(conn);
 
@@ -968,7 +1257,7 @@ impl DbBridgeApp {
                 // La tabla encogió (Live Watch, Refrescar) y la página ya no existe.
                 if let Some(total) = result.total {
                     let last_page = last_page(total);
-                    if self.view.page > last_page {
+                    if self.tab.view.page > last_page {
                         self.go_to_page(last_page);
                         return;
                     }
@@ -977,7 +1266,7 @@ impl DbBridgeApp {
                 let elapsed = result.elapsed.as_millis();
                 let modified = result.modified;
                 let statements = result.statements;
-                self.result = result;
+                self.tab.result = result;
                 if !is_generated {
                     self.remember_query();
                 }
@@ -989,14 +1278,14 @@ impl DbBridgeApp {
                 if modified {
                     self.record_change(format!("{executed} ({elapsed} ms)."));
                 } else if statements > 1 {
-                    self.status = format!("{executed} · {rows} filas · {elapsed} ms");
+                    self.tab.status = format!("{executed} · {rows} filas · {elapsed} ms");
                 } else {
-                    self.status = format!("{rows} filas · {elapsed} ms");
+                    self.tab.status = format!("{rows} filas · {elapsed} ms");
                 }
             }
             Err(error) => {
-                self.result = QueryResult::default();
-                self.status = format!("Error SQL: {error:#}");
+                self.tab.result = QueryResult::default();
+                self.tab.status = format!("Error SQL: {error:#}");
             }
         }
     }
@@ -1004,32 +1293,39 @@ impl DbBridgeApp {
     /// Contexto para modificar una fila de la tabla seleccionada: conexión, tabla, expresión de
     /// la clave y valor de la clave de `row`. Deja el motivo en la barra si no se puede.
     fn row_target(&mut self, row: usize) -> Option<(rusqlite::Connection, String, String, Value)> {
-        let path = self.db_path.clone()?;
-        if self.tasks.is_running(TaskKind::Pull) {
-            self.status =
+        let path = self.tab.db_path.clone()?;
+        if self.tab.tasks.is_running(TaskKind::Pull) {
+            self.tab.status =
                 "Cambio descartado: la base de datos se está volviendo a extraer.".to_string();
             return None;
         }
-        let (Some(object), Some(key_expr)) = (self.selected.clone(), self.result.key_expr.clone())
+        let (Some(object), Some(key_expr)) =
+            (self.tab.selected.clone(), self.tab.result.key_expr.clone())
         else {
-            self.status = "La vista actual no permite editar filas.".to_string();
+            self.tab.status = "La vista actual no permite editar filas.".to_string();
             return None;
         };
-        let Some(key) = self.result.keys.get(row).cloned() else {
-            self.status = "No se encontró la clave de la fila.".to_string();
+        let Some(key) = self.tab.result.keys.get(row).cloned() else {
+            self.tab.status = "No se encontró la clave de la fila.".to_string();
             return None;
         };
         match db::open(&path) {
             Ok(conn) => Some((conn, object.name, key_expr, key)),
             Err(error) => {
-                self.status = format!("Error abriendo la base de datos: {error:#}");
+                self.tab.status = format!("Error abriendo la base de datos: {error:#}");
                 None
             }
         }
     }
 
     fn apply_edit(&mut self, row: usize, column: usize, new_text: String) {
-        let Some(current) = self.result.rows.get(row).and_then(|row| row.get(column)) else {
+        let Some(current) = self
+            .tab
+            .result
+            .rows
+            .get(row)
+            .and_then(|row| row.get(column))
+        else {
             return;
         };
         // Abrir y cerrar el editor sin tocar nada no debe escribir (ni enviar al dispositivo).
@@ -1038,7 +1334,7 @@ impl DbBridgeApp {
             value => db::value_display(value) == new_text,
         };
         if unchanged {
-            self.status = "Sin cambios.".to_string();
+            self.tab.status = "Sin cambios.".to_string();
             return;
         }
         let new_value = if new_text.eq_ignore_ascii_case("NULL") {
@@ -1050,8 +1346,8 @@ impl DbBridgeApp {
     }
 
     fn update_value(&mut self, row: usize, column: usize, new_value: Value) {
-        let Some(column_name) = self.result.columns.get(column).cloned() else {
-            self.status = "No se encontró la columna.".to_string();
+        let Some(column_name) = self.tab.result.columns.get(column).cloned() else {
+            self.tab.status = "No se encontró la columna.".to_string();
             return;
         };
         let Some((conn, table, key_expr, key)) = self.row_target(row) else {
@@ -1060,6 +1356,7 @@ impl DbBridgeApp {
         match db::update_cell(&conn, &table, &key_expr, &key, &column_name, &new_value) {
             Ok(1) => {
                 if let Some(value) = self
+                    .tab
                     .result
                     .rows
                     .get_mut(row)
@@ -1070,10 +1367,10 @@ impl DbBridgeApp {
                 self.record_change(format!("«{column_name}» actualizado (fila {}).", row + 1));
             }
             Ok(_) => {
-                self.status = "La actualización no afectó ninguna fila.".to_string();
+                self.tab.status = "La actualización no afectó ninguna fila.".to_string();
             }
             Err(error) => {
-                self.status = format!("Error actualizando la celda: {error:#}");
+                self.tab.status = format!("Error actualizando la celda: {error:#}");
             }
         }
     }
@@ -1083,25 +1380,26 @@ impl DbBridgeApp {
             return;
         };
         match db::delete_row(&conn, &table, &key_expr, &key) {
-            Ok(0) => self.status = "La fila ya no existe.".to_string(),
+            Ok(0) => self.tab.status = "La fila ya no existe.".to_string(),
             Ok(_) => {
                 drop(conn);
                 self.run_sql();
                 self.record_change(format!("Fila eliminada de «{table}»."));
             }
-            Err(error) => self.status = format!("Error eliminando la fila: {error:#}"),
+            Err(error) => self.tab.status = format!("Error eliminando la fila: {error:#}"),
         }
     }
 
     fn open_insert_form(&mut self) {
-        let (Some(path), Some(object)) = (self.db_path.clone(), self.selected.clone()) else {
+        let (Some(path), Some(object)) = (self.tab.db_path.clone(), self.tab.selected.clone())
+        else {
             return;
         };
         let schema = db::open(&path).and_then(|conn| db::table_schema(&conn, &object.name));
         let schema = match schema {
             Ok(schema) => schema,
             Err(error) => {
-                self.status = format!("No se pudo leer el esquema: {error:#}");
+                self.tab.status = format!("No se pudo leer el esquema: {error:#}");
                 return;
             }
         };
@@ -1131,7 +1429,7 @@ impl DbBridgeApp {
                 }
             })
             .collect();
-        self.insert_form = Some(InsertForm {
+        self.tab.insert_form = Some(InsertForm {
             table: object.name,
             fields,
             error: None,
@@ -1139,13 +1437,13 @@ impl DbBridgeApp {
     }
 
     fn submit_insert(&mut self) {
-        let Some(path) = self.db_path.clone() else {
+        let Some(path) = self.tab.db_path.clone() else {
             return;
         };
-        let Some(form) = &mut self.insert_form else {
+        let Some(form) = &mut self.tab.insert_form else {
             return;
         };
-        if self.tasks.is_running(TaskKind::Pull) {
+        if self.tab.tasks.is_running(TaskKind::Pull) {
             form.error = Some("Espera a que termine la extracción en curso.".to_string());
             return;
         }
@@ -1165,7 +1463,7 @@ impl DbBridgeApp {
         match outcome {
             Ok(_) => {
                 let table = form.table.clone();
-                self.insert_form = None;
+                self.tab.insert_form = None;
                 self.run_sql();
                 self.record_change(format!("Fila insertada en «{table}»."));
             }
@@ -1174,10 +1472,22 @@ impl DbBridgeApp {
     }
 
     fn open_viewer(&mut self, row: usize, column: usize) {
-        let Some(value) = self.result.rows.get(row).and_then(|row| row.get(column)) else {
+        let Some(value) = self
+            .tab
+            .result
+            .rows
+            .get(row)
+            .and_then(|row| row.get(column))
+        else {
             return;
         };
-        let column_name = self.result.columns.get(column).cloned().unwrap_or_default();
+        let column_name = self
+            .tab
+            .result
+            .columns
+            .get(column)
+            .cloned()
+            .unwrap_or_default();
         let (summary, body, blob) = match value {
             Value::Null => ("NULL".to_string(), "NULL".to_string(), None),
             Value::Integer(number) => ("Entero".to_string(), number.to_string(), None),
@@ -1197,7 +1507,7 @@ impl DbBridgeApp {
                 (summary, value_view::hex_dump(bytes), Some(bytes.clone()))
             }
         };
-        self.viewer = Some(ValueViewer {
+        self.tab.viewer = Some(ValueViewer {
             title: format!("{column_name} · fila {}", row + 1),
             summary,
             body,
@@ -1209,23 +1519,61 @@ impl DbBridgeApp {
         match action {
             CellAction::View(row, column) => self.open_viewer(row, column),
             CellAction::Copy(row, column) => {
-                if let Some(value) = self.result.rows.get(row).and_then(|row| row.get(column)) {
+                if let Some(value) = self
+                    .tab
+                    .result
+                    .rows
+                    .get(row)
+                    .and_then(|row| row.get(column))
+                {
                     let text = match value {
                         Value::Blob(bytes) => value_view::hex_dump(bytes),
                         value => db::value_display(value),
                     };
                     ctx.copy_text(text);
-                    self.status = "Valor copiado al portapapeles.".to_string();
+                    self.tab.status = "Valor copiado al portapapeles.".to_string();
                 }
             }
             CellAction::SetNull(row, column) => self.update_value(row, column, Value::Null),
-            CellAction::Delete(row) => self.pending_delete = Some(row),
+            CellAction::Delete(row) => self.tab.pending_delete = Some(row),
         }
     }
 
     /// Diálogos modales: visor de valores, formulario de inserción y confirmación de borrado.
     fn dialogs(&mut self, ctx: &egui::Context) {
-        if let Some(viewer) = &self.viewer {
+        if let Some(index) = self.pending_close {
+            let mut confirmed = false;
+            let mut cancel = false;
+            let tab = self.tab_at(index);
+            let detail = if tab.dirty {
+                "Tiene cambios sin enviar al dispositivo y se perderán."
+            } else {
+                "Tiene una transferencia en curso que quedará sin terminar."
+            };
+            let title = tab.title();
+            let response = egui::Modal::new(egui::Id::unique("confirm_close")).show(ctx, |ui| {
+                ui.set_width(360.0);
+                ui.label(theme::strong(format!("¿Cerrar «{title}»?")));
+                ui.add_space(4.0);
+                ui.label(RichText::new(detail).size(12.0).color(theme::muted()));
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    let close =
+                        egui::Button::new(theme::strong("Cerrar").color(theme::on_accent()))
+                            .fill(theme::danger());
+                    confirmed = ui.add(close).clicked();
+                    cancel = ui.button("Cancelar").clicked();
+                });
+            });
+            if confirmed {
+                self.pending_close = None;
+                self.close_tab(index);
+            } else if cancel || response.should_close() {
+                self.pending_close = None;
+            }
+        }
+
+        if let Some(viewer) = &self.tab.viewer {
             let mut close = false;
             let mut save = false;
             let response = egui::Modal::new(egui::Id::unique("value_viewer")).show(ctx, |ui| {
@@ -1260,18 +1608,18 @@ impl DbBridgeApp {
             if save && let Some(bytes) = &viewer.blob {
                 let name = format!("valor.{}", value_view::blob_extension(bytes));
                 if let Some(path) = rfd::FileDialog::new().set_file_name(name).save_file() {
-                    self.status = match std::fs::write(&path, bytes) {
+                    self.tab.status = match std::fs::write(&path, bytes) {
                         Ok(()) => format!("BLOB guardado en {}", path.display()),
                         Err(error) => format!("No se pudo guardar el BLOB: {error:#}"),
                     };
                 }
             }
             if close || response.should_close() {
-                self.viewer = None;
+                self.tab.viewer = None;
             }
         }
 
-        if let Some(row) = self.pending_delete {
+        if let Some(row) = self.tab.pending_delete {
             let mut confirmed = false;
             let mut cancel = false;
             let response = egui::Modal::new(egui::Id::unique("confirm_delete")).show(ctx, |ui| {
@@ -1279,7 +1627,7 @@ impl DbBridgeApp {
                 ui.label(theme::strong(format!("¿Eliminar la fila {}?", row + 1)));
                 ui.add_space(4.0);
                 ui.label(
-                    RichText::new(if self.target.is_some() && self.settings.auto_push {
+                    RichText::new(if self.tab.target.is_some() && self.settings.auto_push {
                         "Se borrará en la copia local y se enviará al dispositivo."
                     } else {
                         "Se borrará de la base de datos."
@@ -1297,18 +1645,18 @@ impl DbBridgeApp {
                 });
             });
             if confirmed {
-                self.pending_delete = None;
+                self.tab.pending_delete = None;
                 self.delete_row(row);
             } else if cancel || response.should_close() {
-                self.pending_delete = None;
+                self.tab.pending_delete = None;
             }
         }
 
-        if self.insert_form.is_some() {
+        if self.tab.insert_form.is_some() {
             let mut submit = false;
             let mut cancel = false;
             let response = egui::Modal::new(egui::Id::unique("insert_form")).show(ctx, |ui| {
-                let Some(form) = &mut self.insert_form else {
+                let Some(form) = &mut self.tab.insert_form else {
                     return;
                 };
                 ui.set_width(560.0);
@@ -1371,7 +1719,7 @@ impl DbBridgeApp {
             if submit {
                 self.submit_insert();
             } else if cancel || response.should_close() {
-                self.insert_form = None;
+                self.tab.insert_form = None;
             }
         }
     }
@@ -1384,10 +1732,10 @@ impl DbBridgeApp {
         else {
             return;
         };
-        let content = db::to_csv(&self.result);
+        let content = db::to_csv(&self.tab.result);
         match std::fs::write(&path, content) {
-            Ok(()) => self.status = format!("CSV exportado en {}", path.display()),
-            Err(error) => self.status = format!("No se pudo exportar el CSV: {error:#}"),
+            Ok(()) => self.tab.status = format!("CSV exportado en {}", path.display()),
+            Err(error) => self.tab.status = format!("No se pudo exportar el CSV: {error:#}"),
         }
     }
 
@@ -1399,32 +1747,32 @@ impl DbBridgeApp {
         else {
             return;
         };
-        let content = match serde_json::to_string_pretty(&db::to_json(&self.result)) {
+        let content = match serde_json::to_string_pretty(&db::to_json(&self.tab.result)) {
             Ok(content) => content,
             Err(error) => {
-                self.status = format!("No se pudo generar el JSON: {error:#}");
+                self.tab.status = format!("No se pudo generar el JSON: {error:#}");
                 return;
             }
         };
         match std::fs::write(&path, content) {
-            Ok(()) => self.status = format!("JSON exportado en {}", path.display()),
-            Err(error) => self.status = format!("No se pudo exportar el JSON: {error:#}"),
+            Ok(()) => self.tab.status = format!("JSON exportado en {}", path.display()),
+            Err(error) => self.tab.status = format!("No se pudo exportar el JSON: {error:#}"),
         }
     }
 
     fn save_favorite(&mut self) {
         let name = self.new_favorite_name.trim().to_string();
-        if name.is_empty() || self.sql.trim().is_empty() {
-            self.status = "Escribe un nombre y una consulta antes de guardarla.".to_string();
+        if name.is_empty() || self.tab.sql.trim().is_empty() {
+            self.tab.status = "Escribe un nombre y una consulta antes de guardarla.".to_string();
             return;
         }
         self.settings.favorites.push(FavoriteQuery {
             name,
-            sql: self.sql.clone(),
+            sql: self.tab.sql.clone(),
         });
         self.new_favorite_name.clear();
         self.persist();
-        self.status = "Consulta guardada en favoritos.".to_string();
+        self.tab.status = "Consulta guardada en favoritos.".to_string();
     }
 
     /// Consulta la última Release en segundo plano si está activado y toca (o si `force`).
@@ -1478,11 +1826,11 @@ impl DbBridgeApp {
     fn finish_install_update(&mut self, version: String, result: anyhow::Result<()>) {
         match result {
             Ok(()) => {
-                self.status = format!("DB Bridge {version} instalado: reinicia para usarlo.");
+                self.tab.status = format!("DB Bridge {version} instalado: reinicia para usarlo.");
                 self.update_install = Some(UpdateInstall::Installed(version));
             }
             Err(error) => {
-                self.status = format!("No se pudo actualizar: {error:#}");
+                self.tab.status = format!("No se pudo actualizar: {error:#}");
                 self.update_install = Some(UpdateInstall::Failed(format!("{error:#}")));
             }
         }
@@ -1496,7 +1844,7 @@ impl DbBridgeApp {
         match installation.relaunch() {
             Ok(()) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             Err(error) => {
-                self.status = format!("No se pudo reiniciar: {error:#}");
+                self.tab.status = format!("No se pudo reiniciar: {error:#}");
                 self.update_install = Some(UpdateInstall::Failed(format!("{error:#}")));
             }
         }
@@ -1552,7 +1900,8 @@ impl DbBridgeApp {
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if installed {
-                            let busy = self.dirty || self.transfer_running();
+                            let busy = (0..self.tabs.len())
+                                .any(|index| self.tab_at(index).has_pending_work());
                             restart = ui
                                 .add_enabled(!busy, theme::primary_button("Reiniciar ahora"))
                                 .on_disabled_hover_text(
@@ -1635,26 +1984,26 @@ impl DbBridgeApp {
         if interval == 0 {
             return;
         }
-        if self.last_refresh.elapsed() >= Duration::from_secs(interval)
-            && self.editing.is_none()
+        if self.tab.last_refresh.elapsed() >= Duration::from_secs(interval)
+            && self.tab.editing.is_none()
             // Los diálogos guardan índices de fila: no se refresca por debajo de ellos.
-            && self.pending_delete.is_none()
-            && self.insert_form.is_none()
-            && !self.dirty
-            && self.db_path.is_some()
+            && self.tab.pending_delete.is_none()
+            && self.tab.insert_form.is_none()
+            && !self.tab.dirty
+            && self.tab.db_path.is_some()
             && !self.transfer_running()
         {
-            self.last_refresh = Instant::now();
+            self.tab.last_refresh = Instant::now();
             self.refresh();
         }
         ctx.request_repaint_after(Duration::from_millis(250));
     }
 
     fn status_color(&self) -> Color32 {
-        let status = self.status.as_str();
+        let status = self.tab.status.as_str();
         if status.starts_with("Error") || status.starts_with("No se pudo") {
             theme::danger()
-        } else if self.db_path.is_some() {
+        } else if self.tab.db_path.is_some() {
             theme::success()
         } else {
             theme::faint()
@@ -1673,7 +2022,7 @@ impl DbBridgeApp {
 
                 let modes = [SourceMode::Local, SourceMode::Ios, SourceMode::Android]
                     .map(|mode| (mode, mode.label()));
-                let mut mode = self.settings.mode;
+                let mut mode = self.tab.mode;
                 if theme::segmented(ui, &mut mode, &modes) {
                     self.change_mode(mode);
                 }
@@ -1694,8 +2043,8 @@ impl DbBridgeApp {
                     ui.add_space(4.0);
 
                     let transfer_idle = !self.transfer_running();
-                    if self.db_path.is_some()
-                        && self.target.is_some()
+                    if self.tab.db_path.is_some()
+                        && self.tab.target.is_some()
                         && ui
                             .add_enabled(
                                 transfer_idle,
@@ -1708,7 +2057,7 @@ impl DbBridgeApp {
                     {
                         self.push_mobile(None);
                     }
-                    if self.settings.mode != SourceMode::Local
+                    if self.tab.mode != SourceMode::Local
                         && ui
                             .checkbox(&mut self.settings.auto_push, "Push automático")
                             .on_hover_text(
@@ -1724,7 +2073,7 @@ impl DbBridgeApp {
 
             ui.add_space(8.0);
 
-            ui.horizontal_wrapped(|ui| match self.settings.mode {
+            ui.horizontal_wrapped(|ui| match self.tab.mode {
                 SourceMode::Local => {
                     if ui
                         .add(theme::primary_button("Abrir archivo SQLite…"))
@@ -1736,22 +2085,21 @@ impl DbBridgeApp {
                 }
                 SourceMode::Ios | SourceMode::Android => {
                     let mut chosen_device = None;
-                    if !self.detected_devices.is_empty() {
+                    if !self.tab.detected_devices.is_empty() {
                         theme::field(ui, "Dispositivo", |ui| {
                             let selected = self
+                                .tab
                                 .detected_devices
                                 .iter()
-                                .find(|device| device.id == self.settings.device)
-                                .map_or(self.settings.device.as_str(), |device| {
-                                    device.name.as_str()
-                                });
+                                .find(|device| device.id == self.tab.device)
+                                .map_or(self.tab.device.as_str(), |device| device.name.as_str());
                             egui::ComboBox::from_id_salt("device_selector")
                                 .selected_text(selected)
                                 .width(200.0)
                                 .truncate()
                                 .show_ui(ui, |ui| {
-                                    for device in &self.detected_devices {
-                                        let current = device.id == self.settings.device;
+                                    for device in &self.tab.detected_devices {
+                                        let current = device.id == self.tab.device;
                                         if ui
                                             .selectable_label(current, device.name.as_str())
                                             .on_hover_text(theme::mono(device.id.as_str()))
@@ -1762,23 +2110,23 @@ impl DbBridgeApp {
                                     }
                                 })
                                 .response
-                                .on_hover_text(self.settings.device.as_str());
+                                .on_hover_text(self.tab.device.as_str());
                         });
                     }
                     if let Some(device) = chosen_device {
                         self.select_device(device);
                     }
 
-                    let label = if self.settings.mode == SourceMode::Ios {
+                    let label = if self.tab.mode == SourceMode::Ios {
                         "Bundle ID"
                     } else {
                         "Package"
                     };
                     let mut app_changed = false;
                     theme::field(ui, label, |ui| {
-                        if self.detected_apps.is_empty() {
+                        if self.tab.detected_apps.is_empty() {
                             let response = ui.add(
-                                egui::TextEdit::singleline(&mut self.settings.app_id)
+                                egui::TextEdit::singleline(&mut self.tab.app_id)
                                     .frame(Frame::NONE)
                                     .font(egui::TextStyle::Monospace)
                                     .desired_width(220.0)
@@ -1786,21 +2134,21 @@ impl DbBridgeApp {
                                     .hint_text("com.miempresa.app"),
                             );
                             if response.changed() {
-                                self.detected_dbs.clear();
+                                self.tab.detected_dbs.clear();
                             }
                         } else {
                             egui::ComboBox::from_id_salt("app_selector")
-                                .selected_text(if self.settings.app_id.is_empty() {
+                                .selected_text(if self.tab.app_id.is_empty() {
                                     RichText::new("Selecciona una app").color(theme::subtle())
                                 } else {
-                                    theme::mono(self.settings.app_id.as_str())
+                                    theme::mono(self.tab.app_id.as_str())
                                 })
                                 .width(240.0)
                                 .show_ui(ui, |ui| {
-                                    for app in &self.detected_apps {
+                                    for app in &self.tab.detected_apps {
                                         if ui
                                             .selectable_value(
-                                                &mut self.settings.app_id,
+                                                &mut self.tab.app_id,
                                                 app.clone(),
                                                 theme::mono(app),
                                             )
@@ -1813,13 +2161,15 @@ impl DbBridgeApp {
                         }
                     });
                     if app_changed {
+                        self.tab.connect_after_detect = true;
                         self.detect_databases();
                     }
 
+                    let mut db_changed = false;
                     theme::field(ui, "Archivo", |ui| {
-                        if self.detected_dbs.is_empty() {
+                        if self.tab.detected_dbs.is_empty() {
                             ui.add(
-                                egui::TextEdit::singleline(&mut self.settings.db_name)
+                                egui::TextEdit::singleline(&mut self.tab.db_name)
                                     .frame(Frame::NONE)
                                     .font(egui::TextStyle::Monospace)
                                     .desired_width(260.0)
@@ -1828,26 +2178,31 @@ impl DbBridgeApp {
                             );
                         } else {
                             egui::ComboBox::from_id_salt("db_selector")
-                                .selected_text(theme::mono(self.settings.db_name.as_str()))
+                                .selected_text(theme::mono(self.tab.db_name.as_str()))
                                 .width(260.0)
                                 .truncate()
                                 .show_ui(ui, |ui| {
-                                    for database in &self.detected_dbs {
-                                        ui.selectable_value(
-                                            &mut self.settings.db_name,
-                                            database.clone(),
-                                            theme::mono(database),
-                                        );
+                                    for database in &self.tab.detected_dbs {
+                                        db_changed |= ui
+                                            .selectable_value(
+                                                &mut self.tab.db_name,
+                                                database.clone(),
+                                                theme::mono(database),
+                                            )
+                                            .changed();
                                     }
                                 })
                                 .response
-                                .on_hover_text(self.settings.db_name.as_str());
+                                .on_hover_text(self.tab.db_name.as_str());
                         }
                     });
+                    if db_changed {
+                        self.connect_selection();
+                    }
 
-                    let detecting = self.tasks.is_running(TaskKind::DetectDevices)
-                        || self.tasks.is_running(TaskKind::DetectApps)
-                        || self.tasks.is_running(TaskKind::DetectDatabases);
+                    let detecting = self.tab.tasks.is_running(TaskKind::DetectDevices)
+                        || self.tab.tasks.is_running(TaskKind::DetectApps)
+                        || self.tab.tasks.is_running(TaskKind::DetectDatabases);
                     if ui
                         .add_enabled(!detecting, egui::Button::new("Detectar"))
                         .on_hover_text(
@@ -1873,8 +2228,8 @@ impl DbBridgeApp {
             });
 
             let mut switch_to = None;
-            if let Some(notice) = &self.detect_notice
-                && self.settings.mode != SourceMode::Local
+            if let Some(notice) = &self.tab.detect_notice
+                && self.tab.mode != SourceMode::Local
             {
                 ui.add_space(6.0);
                 ui.horizontal_wrapped(|ui| {
@@ -1905,7 +2260,8 @@ impl DbBridgeApp {
             .frame(frame)
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    if let Some(kind) = self.tasks.running().last() {
+                    if let Some(kind) = self.tab.tasks.running().chain(self.tasks.running()).last()
+                    {
                         ui.add(egui::Spinner::new().size(12.0).color(theme::accent()));
                         ui.label(RichText::new(kind.label()).size(12.0).color(theme::text()));
                         ui.add_space(8.0);
@@ -1913,11 +2269,13 @@ impl DbBridgeApp {
                     theme::dot(ui, self.status_color(), 3.5);
                     ui.add(
                         egui::Label::new(
-                            RichText::new(&self.status).size(12.0).color(theme::muted()),
+                            RichText::new(&self.tab.status)
+                                .size(12.0)
+                                .color(theme::muted()),
                         )
                         .truncate(),
                     );
-                    if self.dirty {
+                    if self.tab.dirty {
                         ui.add_space(8.0);
                         theme::dot(ui, theme::warning(), 3.5);
                         ui.label(
@@ -1928,7 +2286,7 @@ impl DbBridgeApp {
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         self.version_menu(ui);
-                        if let Some(path) = &self.db_path {
+                        if let Some(path) = &self.tab.db_path {
                             ui.label(
                                 theme::mono(path.display().to_string())
                                     .size(11.5)
@@ -2005,10 +2363,10 @@ impl DbBridgeApp {
 
                 ui.horizontal(|ui| {
                     theme::section_label(ui, "Tablas");
-                    if !self.objects.is_empty() {
+                    if !self.tab.objects.is_empty() {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.label(
-                                RichText::new(self.objects.len().to_string())
+                                RichText::new(self.tab.objects.len().to_string())
                                     .size(11.5)
                                     .color(theme::subtle()),
                             );
@@ -2016,7 +2374,7 @@ impl DbBridgeApp {
                     }
                 });
                 ui.add(
-                    egui::TextEdit::singleline(&mut self.table_filter)
+                    egui::TextEdit::singleline(&mut self.tab.table_filter)
                         .hint_text("Filtrar tablas")
                         .desired_width(f32::INFINITY),
                 );
@@ -2027,15 +2385,16 @@ impl DbBridgeApp {
                     .max_height(320.0)
                     .show(ui, |ui| {
                         ui.spacing_mut().item_spacing.y = 2.0;
-                        if self.objects.is_empty() {
+                        if self.tab.objects.is_empty() {
                             ui.weak("Sin conexión.");
                         }
-                        let filter = self.table_filter.trim().to_lowercase();
-                        for object in self.objects.clone() {
+                        let filter = self.tab.table_filter.trim().to_lowercase();
+                        for object in self.tab.objects.clone() {
                             if !filter.is_empty() && !object.name.to_lowercase().contains(&filter) {
                                 continue;
                             }
                             let selected = self
+                                .tab
                                 .selected
                                 .as_ref()
                                 .map(|current| current.name == object.name)
@@ -2099,11 +2458,11 @@ impl DbBridgeApp {
                                 .right_text("")
                                 .min_size(egui::vec2(width, 28.0));
                                 if ui.add(button).on_hover_text(&favorite.sql).clicked() {
-                                    self.sql = favorite.sql.clone();
-                                    self.generated_sql = None;
-                                    self.selected = None;
-                                    self.diff = None;
-                                    self.editing = None;
+                                    self.tab.sql = favorite.sql.clone();
+                                    self.tab.generated_sql = None;
+                                    self.tab.selected = None;
+                                    self.tab.diff = None;
+                                    self.tab.editing = None;
                                     self.run_sql();
                                 }
                                 let delete = egui::Button::new(
@@ -2128,13 +2487,13 @@ impl DbBridgeApp {
         theme::card().inner_margin(Margin::same(12)).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.spacing_mut().item_spacing.y = 4.0;
-            match &self.db_path {
+            match &self.tab.db_path {
                 Some(path) => {
                     ui.horizontal(|ui| {
                         theme::dot(ui, theme::success(), 4.0);
-                        ui.label(theme::strong(self.settings.mode.label()));
+                        ui.label(theme::strong(self.tab.mode.label()));
                     });
-                    if let Some(origin) = &self.origin {
+                    if let Some(origin) = &self.tab.origin {
                         ui.add(
                             egui::Label::new(theme::mono(origin.as_str()).color(theme::muted()))
                                 .truncate(),
@@ -2170,8 +2529,8 @@ impl DbBridgeApp {
     }
 
     fn baseline_controls(&mut self, ui: &mut egui::Ui) {
-        let pulling = self.tasks.is_running(TaskKind::Pull);
-        match &self.baseline {
+        let pulling = self.tab.tasks.is_running(TaskKind::Pull);
+        match &self.tab.baseline {
             None => {
                 if ui
                     .add_enabled(!pulling, egui::Button::new("Fijar línea base"))
@@ -2195,14 +2554,14 @@ impl DbBridgeApp {
                     );
                 });
                 ui.horizontal(|ui| {
-                    let label = if self.diff.is_some() {
+                    let label = if self.tab.diff.is_some() {
                         "Ocultar cambios"
                     } else {
                         "Ver cambios"
                     };
                     if ui.add_enabled(!pulling, egui::Button::new(label)).clicked() {
-                        if self.diff.is_some() {
-                            self.diff = None;
+                        if self.tab.diff.is_some() {
+                            self.tab.diff = None;
                         } else {
                             self.compare_with_baseline();
                         }
@@ -2230,7 +2589,7 @@ impl DbBridgeApp {
     }
 
     fn diff_card(&mut self, ui: &mut egui::Ui) {
-        let Some(diff) = self.diff.take() else {
+        let Some(diff) = self.tab.diff.take() else {
             return;
         };
         let mut close = false;
@@ -2246,7 +2605,7 @@ impl DbBridgeApp {
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.label(theme::strong("Cambios desde la línea base"));
-                        if let Some(baseline) = &self.baseline {
+                        if let Some(baseline) = &self.tab.baseline {
                             ui.label(
                                 RichText::new(format_age(baseline.taken_at.elapsed()))
                                     .color(theme::muted()),
@@ -2287,7 +2646,7 @@ impl DbBridgeApp {
                             );
                             ui.add_space(4.0);
                             ui.label(
-                                RichText::new(if self.target.is_some() {
+                                RichText::new(if self.tab.target.is_some() {
                                     "Usa la app: con Live Watch activo los cambios aparecen solos."
                                 } else {
                                     "Modifica el archivo y pulsa Recalcular."
@@ -2311,7 +2670,7 @@ impl DbBridgeApp {
         });
 
         if !close {
-            self.diff = Some(diff);
+            self.tab.diff = Some(diff);
         }
         if recompute {
             self.compare_with_baseline();
@@ -2321,11 +2680,11 @@ impl DbBridgeApp {
     fn central_panel(&mut self, ui: &mut egui::Ui) {
         let frame = Frame::NONE.fill(theme::bg()).inner_margin(Margin::same(16));
         egui::CentralPanel::default().frame(frame).show(ui, |ui| {
-            if self.db_path.is_none() {
+            if self.tab.db_path.is_none() {
                 self.welcome(ui);
                 return;
             }
-            if self.diff.is_some() {
+            if self.tab.diff.is_some() {
                 self.diff_card(ui);
                 return;
             }
@@ -2373,7 +2732,7 @@ impl DbBridgeApp {
                                 for (column, (mode, description)) in
                                     columns.iter_mut().zip(sources)
                                 {
-                                    let active = self.settings.mode == mode;
+                                    let active = self.tab.mode == mode;
                                     if source_card(column, mode, description, active) {
                                         picked = Some(mode);
                                     }
@@ -2450,10 +2809,10 @@ impl DbBridgeApp {
             self.pick_local_file();
             return;
         }
-        if self.settings.mode != mode {
-            self.settings.mode = mode;
-            self.detected_apps.clear();
-            self.detected_dbs.clear();
+        if self.tab.mode != mode {
+            self.tab.mode = mode;
+            self.tab.detected_apps.clear();
+            self.tab.detected_dbs.clear();
             self.persist();
         }
         self.detect_devices(false);
@@ -2483,13 +2842,13 @@ impl DbBridgeApp {
                             self.run_sql();
                         }
                         if ui
-                            .add_enabled(self.db_path.is_some(), egui::Button::new("Refrescar"))
+                            .add_enabled(self.tab.db_path.is_some(), egui::Button::new("Refrescar"))
                             .clicked()
                         {
                             self.refresh();
                         }
                         if ui
-                            .add_enabled(self.db_path.is_some(), egui::Button::new("Plan"))
+                            .add_enabled(self.tab.db_path.is_some(), egui::Button::new("Plan"))
                             .on_hover_text("EXPLAIN QUERY PLAN de la consulta del editor.")
                             .clicked()
                         {
@@ -2515,25 +2874,25 @@ impl DbBridgeApp {
                             });
                         });
                         if let Some(sql) = chosen {
-                            self.sql = sql;
-                            self.generated_sql = None;
-                            self.selected = None;
-                            self.editing = None;
-                            self.status =
+                            self.tab.sql = sql;
+                            self.tab.generated_sql = None;
+                            self.tab.selected = None;
+                            self.tab.editing = None;
+                            self.tab.status =
                                 "Consulta del historial cargada en el editor.".to_string();
                         }
 
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.button("Limpiar").clicked() {
-                                self.result = QueryResult::default();
-                                self.selected = None;
-                                self.generated_sql = None;
-                                self.editing = None;
-                                self.sql = DEFAULT_SQL.to_string();
-                                self.status = "Vista limpiada.".to_string();
+                                self.tab.result = QueryResult::default();
+                                self.tab.selected = None;
+                                self.tab.generated_sql = None;
+                                self.tab.editing = None;
+                                self.tab.sql = DEFAULT_SQL.to_string();
+                                self.tab.status = "Vista limpiada.".to_string();
                             }
 
-                            let can_export = !self.result.rows.is_empty();
+                            let can_export = !self.tab.result.rows.is_empty();
                             if ui
                                 .add_enabled(can_export, egui::Button::new("Exportar JSON"))
                                 .clicked()
@@ -2556,7 +2915,7 @@ impl DbBridgeApp {
                 .inner_margin(Margin::symmetric(14, 10))
                 .show(ui, |ui| {
                     ui.horizontal_top(|ui| {
-                        let lines = self.sql.split('\n').count();
+                        let lines = self.tab.sql.split('\n').count();
                         let digits = lines.to_string().len().max(2);
                         let numbers = (1..=lines)
                             .map(|line| format!("{line:>digits$}"))
@@ -2580,7 +2939,7 @@ impl DbBridgeApp {
                             .id_salt("sql_scroll")
                             .show(ui, |ui| {
                                 ui.add(
-                                    egui::TextEdit::multiline(&mut self.sql)
+                                    egui::TextEdit::multiline(&mut self.tab.sql)
                                         .frame(Frame::NONE)
                                         .margin(Margin::ZERO)
                                         .desired_rows(4)
@@ -2613,43 +2972,43 @@ impl DbBridgeApp {
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         let title = self
-                            .selected
+                            .tab.selected
                             .as_ref()
                             .map(|object| object.name.clone())
                             .unwrap_or_else(|| "Consulta".to_string());
                         ui.label(theme::mono(title).color(theme::text()));
 
-                        if self.selected.is_some() {
+                        if self.tab.selected.is_some() {
                             let tabs = [(ResultsTab::Data, "Datos"), (ResultsTab::Schema, "Esquema")];
-                            if theme::segmented(ui, &mut self.results_tab, &tabs) {
-                                self.editing = None;
+                            if theme::segmented(ui, &mut self.tab.results_tab, &tabs) {
+                                self.tab.editing = None;
                             }
                         }
-                        if self.results_tab == ResultsTab::Schema && self.selected.is_some() {
+                        if self.tab.results_tab == ResultsTab::Schema && self.tab.selected.is_some() {
                             return;
                         }
-                        let table_view = self.selected.is_some()
+                        let table_view = self.tab.selected.is_some()
                             && self
-                                .generated_sql
+                                .tab.generated_sql
                                 .as_deref()
-                                .is_some_and(|generated| generated.trim() == self.sql.trim());
+                                .is_some_and(|generated| generated.trim() == self.tab.sql.trim());
                         if table_view {
                             let filter = ui.add(
-                                egui::TextEdit::singleline(&mut self.view.filter)
+                                egui::TextEdit::singleline(&mut self.tab.view.filter)
                                     .hint_text("Filtrar filas…")
                                     .desired_width(170.0),
                             );
                             if filter.changed() {
-                                self.view.page = 0;
+                                self.tab.view.page = 0;
                                 self.load_view();
                             }
                         }
 
-                        if !self.result.columns.is_empty() {
-                            let rows = self.result.rows.len();
-                            let summary = match self.result.total {
+                        if !self.tab.result.columns.is_empty() {
+                            let rows = self.tab.result.rows.len();
+                            let summary = match self.tab.result.total {
                                 Some(total) if rows > 0 => {
-                                    let first = self.view.page * db::ROW_LIMIT + 1;
+                                    let first = self.tab.view.page * db::ROW_LIMIT + 1;
                                     format!("filas {first}–{} de {total}", first + rows - 1)
                                 }
                                 Some(total) => format!("{total} filas"),
@@ -2658,11 +3017,11 @@ impl DbBridgeApp {
                             ui.label(
                                 RichText::new(format!(
                                     "{summary} · {} ms",
-                                    self.result.elapsed.as_millis()
+                                    self.tab.result.elapsed.as_millis()
                                 ))
                                 .color(theme::muted()),
                             );
-                            if self.result.is_editable() {
+                            if self.tab.result.is_editable() {
                                 theme::badge(
                                     ui,
                                     "Editable",
@@ -2674,7 +3033,7 @@ impl DbBridgeApp {
                             }
                         }
 
-                        if self.result.is_editable() {
+                        if self.tab.result.is_editable() {
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
@@ -2703,9 +3062,9 @@ impl DbBridgeApp {
 
             ui.add(egui::Separator::default().spacing(0.0));
 
-            let schema_tab = self.results_tab == ResultsTab::Schema && self.selected.is_some();
+            let schema_tab = self.tab.results_tab == ResultsTab::Schema && self.tab.selected.is_some();
             let paged = self
-                .result
+                .tab.result
                 .total
                 .filter(|total| !schema_tab && last_page(*total) > 0);
             Frame::NONE
@@ -2736,27 +3095,28 @@ impl DbBridgeApp {
     }
 
     fn render_schema(&mut self, ui: &mut egui::Ui) {
-        let Some(name) = self.selected.as_ref().map(|object| object.name.clone()) else {
+        let Some(name) = self.tab.selected.as_ref().map(|object| object.name.clone()) else {
             return;
         };
-        if self.tasks.is_running(TaskKind::Pull) {
+        if self.tab.tasks.is_running(TaskKind::Pull) {
             ui.weak("Extrayendo la base de datos…");
             return;
         }
         if self
+            .tab
             .schema
             .as_ref()
             .is_none_or(|(loaded, _)| *loaded != name)
         {
-            let schema = match &self.db_path {
+            let schema = match &self.tab.db_path {
                 Some(path) => db::open(path)
                     .and_then(|conn| db::table_schema(&conn, &name))
                     .map_err(|error| format!("{error:#}")),
                 None => return,
             };
-            self.schema = Some((name, schema));
+            self.tab.schema = Some((name, schema));
         }
-        let Some((_, schema)) = &self.schema else {
+        let Some((_, schema)) = &self.tab.schema else {
             return;
         };
         match schema {
@@ -2772,21 +3132,21 @@ impl DbBridgeApp {
 
     fn live_watch_selector(&mut self, ui: &mut egui::Ui) {
         ui.label(RichText::new("Live Watch").size(12.0).color(theme::muted()))
-            .on_hover_text(if self.target.is_some() {
+            .on_hover_text(if self.tab.target.is_some() {
                 "Vuelve a extraer la base de datos del dispositivo y a ejecutar la consulta \
                  cada cierto tiempo. Se pausa mientras editas o hay cambios sin push."
             } else {
                 "Vuelve a ejecutar la consulta cada cierto tiempo."
             });
         if theme::segmented(ui, &mut self.settings.live_watch_secs, &LIVE_WATCH_OPTIONS) {
-            self.last_refresh = Instant::now();
+            self.tab.last_refresh = Instant::now();
             self.persist();
         }
     }
 
     /// Controles de página, de derecha a izquierda: » › «Página n de m» ‹ «.
     fn pager(&mut self, ui: &mut egui::Ui, last_page: usize) {
-        let page = self.view.page;
+        let page = self.tab.view.page;
         let mut target = None;
         ui.spacing_mut().item_spacing.x = 2.0;
         let mut nav = |ui: &mut egui::Ui, text: &str, enabled: bool, to: usize, hint: &str| {
@@ -2816,7 +3176,7 @@ impl DbBridgeApp {
     /// Rejilla de resultados. `reserved` es la altura que debe quedar libre debajo (el pie de
     /// paginación).
     fn render_results(&mut self, ui: &mut egui::Ui, reserved: f32) {
-        if self.result.columns.is_empty() {
+        if self.tab.result.columns.is_empty() {
             ui.add_space(24.0);
             ui.vertical_centered(|ui| {
                 ui.label(
@@ -2830,12 +3190,12 @@ impl DbBridgeApp {
             return;
         }
 
-        let editable = self.result.is_editable();
+        let editable = self.tab.result.is_editable();
         let mut commit: Option<(usize, usize, String)> = None;
         let mut cancel = false;
         let mut action = None;
         // Solo las páginas de una tabla (las que traen total) se ordenan desde la cabecera.
-        let sortable = self.result.total.is_some();
+        let sortable = self.tab.result.total.is_some();
         let mut sort_by: Option<String> = None;
 
         egui::ScrollArea::both()
@@ -2850,8 +3210,8 @@ impl DbBridgeApp {
                     .spacing(egui::vec2(20.0, 4.0))
                     .show(ui, |ui| {
                         ui.label(theme::mono("#").color(theme::faint()));
-                        for column in &self.result.columns {
-                            let arrow = match &self.view.sort {
+                        for column in &self.tab.result.columns {
+                            let arrow = match &self.tab.view.sort {
                                 Some((sorted, false)) if sorted == column && sortable => " ▲",
                                 Some((sorted, true)) if sorted == column && sortable => " ▼",
                                 _ => "",
@@ -2878,13 +3238,14 @@ impl DbBridgeApp {
                         }
                         ui.end_row();
 
-                        for (row_index, row) in self.result.rows.iter().enumerate() {
+                        for (row_index, row) in self.tab.result.rows.iter().enumerate() {
                             ui.label(
                                 theme::mono((row_index + 1).to_string()).color(theme::faint()),
                             );
 
                             for (column_index, value) in row.iter().enumerate() {
                                 let is_editing = self
+                                    .tab
                                     .editing
                                     .as_ref()
                                     .map(|edit| {
@@ -2893,7 +3254,7 @@ impl DbBridgeApp {
                                     .unwrap_or(false);
 
                                 if is_editing {
-                                    let Some(mut edit) = self.editing.take() else {
+                                    let Some(mut edit) = self.tab.editing.take() else {
                                         continue;
                                     };
                                     let response = ui.add(
@@ -2915,17 +3276,17 @@ impl DbBridgeApp {
                                     if response.lost_focus() {
                                         if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
                                             cancel = true;
-                                            self.editing = None;
+                                            self.tab.editing = None;
                                         } else {
                                             commit = Some((
                                                 row_index,
                                                 column_index,
                                                 edit.buffer.clone(),
                                             ));
-                                            self.editing = Some(edit);
+                                            self.tab.editing = Some(edit);
                                         }
                                     } else {
-                                        self.editing = Some(edit);
+                                        self.tab.editing = Some(edit);
                                     }
                                 } else {
                                     let preview = match value {
@@ -2945,7 +3306,7 @@ impl DbBridgeApp {
                                         // Un BLOB o un texto largo no caben en el editor de
                                         // una línea: se abren en el visor.
                                         if editable && !is_blob && preview.is_none() {
-                                            self.editing = Some(CellEdit {
+                                            self.tab.editing = Some(CellEdit {
                                                 row: row_index,
                                                 column: column_index,
                                                 buffer: if matches!(value, Value::Null) {
@@ -3000,11 +3361,11 @@ impl DbBridgeApp {
             });
 
         if cancel {
-            self.editing = None;
-            self.status = "Edición cancelada.".to_string();
+            self.tab.editing = None;
+            self.tab.status = "Edición cancelada.".to_string();
         }
         if let Some((row, column, value)) = commit {
-            self.editing = None;
+            self.tab.editing = None;
             self.apply_edit(row, column, value);
         }
         if let Some(action) = action {
@@ -3364,6 +3725,11 @@ fn file_name(path: &std::path::Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
+/// Último tramo de una ruta relativa del dispositivo: `databases/offline.db` → `offline.db`.
+fn last_segment(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
 fn cell_text(value: &Value) -> RichText {
     match value {
         Value::Null => RichText::new(" NULL ")
@@ -3388,10 +3754,58 @@ impl eframe::App for DbBridgeApp {
         self.tick_live_watch(&ctx);
 
         self.update_banner(ui);
+        self.tab_bar(ui);
         self.top_panel(ui);
         self.status_panel(ui);
         self.side_panel(ui);
         self.central_panel(ui);
         self.dialogs(&ctx);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn last_segment_keeps_the_file_name() {
+        assert_eq!(last_segment("databases/offline.db"), "offline.db");
+        assert_eq!(
+            last_segment("Library/Application Support/default.store"),
+            "default.store"
+        );
+        assert_eq!(last_segment("offline.db"), "offline.db");
+    }
+
+    #[test]
+    fn sibling_tab_copies_the_selection_but_not_the_connection() {
+        let ctx = egui::Context::default();
+        let mut tab = Tab::new(&ctx, 0, SourceMode::Ios);
+        tab.device = "A1B2".to_string();
+        tab.app_id = "com.example.app".to_string();
+        tab.db_name = "Documents/offline.db".to_string();
+        tab.detected_dbs = vec![
+            "Documents/offline.db".to_string(),
+            "Documents/cache.db".to_string(),
+        ];
+        tab.db_path = Some(PathBuf::from("/tmp/offline.db"));
+        tab.target = Some(MobileTarget {
+            mode: SourceMode::Ios,
+            device: "A1B2".to_string(),
+            app_id: "com.example.app".to_string(),
+            db_name: "Documents/offline.db".to_string(),
+        });
+        tab.dirty = true;
+        assert_eq!(tab.title(), "iOS · offline.db");
+
+        let sibling = tab.sibling(&ctx, 1);
+        assert_eq!(sibling.id, 1);
+        assert_eq!(sibling.mode, SourceMode::Ios);
+        assert_eq!(sibling.device, "A1B2");
+        assert_eq!(sibling.app_id, "com.example.app");
+        assert_eq!(sibling.detected_dbs, tab.detected_dbs);
+        assert!(sibling.db_path.is_none() && sibling.target.is_none());
+        assert!(!sibling.dirty && !sibling.has_pending_work());
+        assert_eq!(sibling.title(), "iOS · sin conexión");
     }
 }
