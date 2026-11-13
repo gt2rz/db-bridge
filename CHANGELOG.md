@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.5](https://github.com/gt2rz/db-bridge/compare/v0.1.4...v0.1.5) (2026-11-13)
+
+
+### Novedades
+
+* pestañas independientes y conexión automática al cambiar de archivo ([#7](https://github.com/gt2rz/db-bridge/issues/7)) ([9539431](https://github.com/gt2rz/db-bridge/commit/9539431342721e5b2c091501e2fba04f8d22ebc5))
+
 ## [0.1.4](https://github.com/gt2rz/db-bridge/compare/v0.1.3...v0.1.4) (2026-11-12)
 
 
