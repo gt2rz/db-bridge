@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.4](https://github.com/gt2rz/db-bridge/compare/v0.1.3...v0.1.4) (2026-11-12)
+
+
+### Novedades
+
+* selector de tema claro, oscuro o automático ([87ed22a](https://github.com/gt2rz/db-bridge/commit/87ed22a011b7ea2ccb36d0204064af86bc05a819))
+
 ## [0.1.3](https://github.com/gt2rz/db-bridge/compare/v0.1.2...v0.1.3) (2026-11-12)
 
 
