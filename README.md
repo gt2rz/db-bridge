@@ -94,7 +94,8 @@ Con un archivo local los cambios se escriben directamente en el archivo. Con un 
 
 ## Versiones y publicación
 
-- `.github/workflows/ci.yml`: formato, clippy y tests en Linux, macOS y Windows, y auditoría de dependencias con `cargo-deny` (`deny.toml`), en cada push y PR.
+- `.github/workflows/ci.yml`: formato (una vez), clippy y tests en Linux, macOS y Windows, y auditoría de dependencias con `cargo-deny` (`deny.toml`), en cada push y PR. Si solo cambian `docs/` o archivos `.md`, no se compila. La auditoría se repite cada lunes. El job final `CI` resume todos y es el único check obligatorio del ruleset.
+- `.github/actions/setup-rust`: acción compuesta que comparten CI y release (dependencias de sistema de Linux y caché de Rust).
 - `.github/workflows/release.yml`: [release-please](https://github.com/googleapis/release-please) mantiene una PR de versión a partir de los commits convencionales (`feat:`, `fix:`…). Al fusionarla actualiza `Cargo.toml`, `Cargo.lock` y `CHANGELOG.md`, crea la etiqueta `vX.Y.Z` y la Release, y compila y adjunta:
   - `DB-Bridge-macOS-universal.dmg` (Apple Silicon + Intel, firma ad hoc),
   - `db-bridge-windows-x86_64.zip`,

@@ -81,24 +81,17 @@ jobs:
           ref: ${{ needs.release-please.outputs.tag }}
           persist-credentials: false
 
-      - name: Dependencias de sistema (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y pkg-config libxkbcommon-dev libwayland-dev \
-            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libgl1-mesa-dev
-
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: ./.github/actions/setup-rust
         with:
-          key: release-${{ matrix.platform }}
+          cache-key: release-${{ matrix.platform }}
 
       - name: Compilar y empaquetar (macOS universal)
         if: matrix.platform == 'macos'
         shell: bash
         run: |
           rustup target add aarch64-apple-darwin x86_64-apple-darwin
-          cargo build --release --locked --target aarch64-apple-darwin
-          cargo build --release --locked --target x86_64-apple-darwin
+          # Una sola invocación compila las dos arquitecturas en paralelo.
+          cargo build --release --locked --target aarch64-apple-darwin --target x86_64-apple-darwin
 
           app="dist/DB Bridge.app"
           mkdir -p "$app/Contents/MacOS"

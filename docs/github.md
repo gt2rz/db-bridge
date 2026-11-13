@@ -62,8 +62,9 @@ Importa los dos archivos de `.github/rulesets/`:
   - Nada de pushes directos, force push ni borrado; historial lineal; solo squash.
   - Toda PR necesita **tu aprobación como code owner**, con los hilos resueltos; un push nuevo
     invalida la aprobación anterior.
-  - Checks obligatorios: los tres `Comprobar (…)` y `Auditoría de dependencias`, con la rama al
-    día.
+  - Check obligatorio: `CI`, con la rama al día. Es el job final de `ci.yml` y solo pasa si
+    pasan (o se omiten) formato, `Comprobar (…)` en los tres sistemas y la auditoría; así, cambiar
+    la matriz o saltarse la compilación en una PR de documentación no exige tocar el ruleset.
   - Bypass: rol **Admin**, solo a través de PR. Lo necesitas para fusionar tus propias PRs
     (GitHub no deja aprobar las propias) y, sin la App, la PR de release-please.
 - `tags.json` — etiquetas `v*`: no se pueden mover ni borrar (las crea release-please; solo un
@@ -107,7 +108,7 @@ Activa:
 ## Flujo de trabajo resultante
 
 1. Trabajas en una rama y abres PR con título convencional (`feat: …`).
-2. El CI y la auditoría pasan → la fusionas (squash) usando el bypass de admin.
+2. El check `CI` pasa → la fusionas (squash) usando el bypass de admin.
 3. release-please actualiza su PR de versión → la revisas, la apruebas y la fusionas.
 4. Se crean la etiqueta y la Release, se compilan los binarios con su atestación y la landing
    se actualiza.

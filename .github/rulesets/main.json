@@ -28,12 +28,7 @@
       "parameters": {
         "strict_required_status_checks_policy": true,
         "do_not_enforce_on_create": false,
-        "required_status_checks": [
-          { "context": "Comprobar (ubuntu-22.04)", "integration_id": 15368 },
-          { "context": "Comprobar (macos-latest)", "integration_id": 15368 },
-          { "context": "Comprobar (windows-latest)", "integration_id": 15368 },
-          { "context": "Auditoría de dependencias", "integration_id": 15368 }
-        ]
+        "required_status_checks": [{ "context": "CI", "integration_id": 15368 }]
       }
     }
   ],

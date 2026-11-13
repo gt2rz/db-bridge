@@ -1,0 +1,25 @@
+name: Preparar Rust
+description: >
+  Dependencias de sistema que egui necesita en Linux y caché de compilación de Rust. El toolchain
+  lo instala rustup al primer `cargo` a partir de rust-toolchain.toml. Requiere el checkout hecho.
+
+inputs:
+  cache-key:
+    description: Clave extra de la caché, para no mezclar compilaciones de CI y de release.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Dependencias de sistema (Linux)
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y pkg-config libxkbcommon-dev libwayland-dev \
+          libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libgl1-mesa-dev
+
+    - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      with:
+        key: ${{ inputs.cache-key }}
