@@ -66,10 +66,18 @@ fn is_sidecar(path: &str) -> bool {
         .any(|suffix| path.ends_with(suffix))
 }
 
-pub fn staging_dir(mode: SourceMode, app_id: &str) -> PathBuf {
+/// Carpeta de la copia local. Va por dispositivo para que dos pestañas con la misma app en
+/// simuladores distintos no se pisen la copia.
+pub fn staging_dir(mode: SourceMode, device: &str, app_id: &str) -> PathBuf {
+    let device = if device.trim().is_empty() {
+        "default".to_string()
+    } else {
+        sanitize(device)
+    };
     std::env::temp_dir()
         .join("db-bridge")
         .join(mode.tag())
+        .join(device)
         .join(sanitize(app_id))
 }
 
@@ -93,7 +101,7 @@ pub fn pull(mode: SourceMode, device: &str, app_id: &str, db_name: &str) -> Resu
     validate_db_name(mode, db_name)?;
     let app_id = app_id.trim();
     let db_name = db_name.trim();
-    let staging = staging_dir(mode, app_id);
+    let staging = staging_dir(mode, device, app_id);
 
     match mode {
         SourceMode::Local => bail!("el modo local no necesita extracción"),
@@ -232,12 +240,15 @@ mod tests {
     }
 
     #[test]
-    fn staging_directory_is_per_mode_and_app() {
-        let ios = staging_dir(SourceMode::Ios, "com.example.app");
-        let android = staging_dir(SourceMode::Android, "com.example.app");
-        assert!(ios.ends_with("ios/com.example.app"));
-        assert!(android.ends_with("android/com.example.app"));
+    fn staging_directory_is_per_mode_device_and_app() {
+        let ios = staging_dir(SourceMode::Ios, "", "com.example.app");
+        let android = staging_dir(SourceMode::Android, "emulator-5554", "com.example.app");
+        assert!(ios.ends_with("ios/default/com.example.app"));
+        assert!(android.ends_with("android/emulator-5554/com.example.app"));
         assert_ne!(ios, android);
+
+        let other_simulator = staging_dir(SourceMode::Ios, "A1B2-C3D4", "com.example.app");
+        assert_ne!(ios, other_simulator);
     }
 
     #[test]

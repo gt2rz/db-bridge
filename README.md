@@ -11,6 +11,8 @@ Construido en Rust con `eframe`/`egui` (UI nativa, sin WebView) y `rusqlite` (SQ
 - Android: extrae la BD del emulador/dispositivo con `run-as` (requiere APK debuggable).
 - Selector de dispositivo cuando hay varios simuladores encendidos o varios dispositivos/emuladores en `adb` (`-s <serial>` / UDID). Se recuerda entre sesiones y en las conexiones recientes.
 - Detección automática de apps instaladas (filtra las apps de sistema) y de las bases de datos dentro de cada app.
+- **Pestañas**: cada una es una conexión independiente con su origen, dispositivo, app, archivo, consulta, resultados, línea base y cambios sin push. Sirven para tener a la vez un simulador iOS y un emulador Android, o dos archivos de la misma app. **+** abre una pestaña con el mismo dispositivo y app que la activa; las extracciones y pushes de las pestañas que no se ven siguen en segundo plano, y Live Watch refresca solo la visible. Cerrar una pestaña con cambios sin push o una transferencia en curso pide confirmación.
+- Conexión automática: al elegir otro archivo en el desplegable (o cambiar de dispositivo o de app) se extrae y conecta sin pulsar **Extraer y conectar**, salvo que haya cambios sin push.
 - Tamaño en disco de la BD conectada (y de su `-wal`, si lo hay) en la tarjeta de conexión.
 - Navegación de tablas y vistas con indicador de solo lectura.
 - Pestaña **Esquema** de cada tabla o vista: columnas (tipo, `NOT NULL`, valor por defecto, posición en la PK), índices (incluidos los automáticos de `UNIQUE`/PK, parciales y de expresión), claves foráneas con sus acciones, triggers y las sentencias `CREATE` originales con resaltado.
@@ -76,7 +78,7 @@ db-bridge
 1. Arranca el simulador y abre tu app al menos una vez para que cree la BD.
 2. Elige **Simulador iOS** en el selector de origen.
 3. Pulsa **Detectar**, elige el simulador si hay más de uno encendido, tu bundle ID y la base de datos del desplegable (se detectan por la cabecera `SQLite format 3`, así que también aparecen los `.store` de SwiftData/Core Data). Si no aparece, escribe el nombre del archivo.
-4. Pulsa **Extraer y conectar**.
+4. Pulsa **Extraer y conectar**. A partir de ahí, elegir otro archivo, bundle ID o simulador en los desplegables vuelve a extraer y conectar solo.
 
 La herramienta busca el archivo en `Documents`, `Library/Application Support`, `Library`, `Library/Caches` y `tmp`, y si no aparece recorre el contenedor con un límite de profundidad.
 
@@ -86,7 +88,9 @@ La herramienta busca el archivo en `Documents`, `Library/Application Support`, `
 2. Elige **Emulador Android**.
 3. Pulsa **Detectar**, elige el dispositivo si hay más de uno conectado y el package, o escríbelo a mano y vuelve a pulsar **Detectar**.
 4. Elige la base de datos del desplegable: se listan los archivos de `databases/` y los `.db`, `.db3`, `.sqlite` y `.sqlite3` del resto del contenedor. También puedes escribir el nombre: `databases/` se busca primero y luego todo el contenedor con `find`.
-5. Pulsa **Extraer y conectar**.
+5. Pulsa **Extraer y conectar**. A partir de ahí, elegir otro archivo, package o dispositivo en los desplegables vuelve a extraer y conectar solo.
+
+Para mirar otra base de datos sin perder la actual (otro archivo de la misma app, o el otro emulador), abre una pestaña con **+**.
 
 Con un archivo local los cambios se escriben directamente en el archivo. Con un simulador/dispositivo se aplican primero en una copia local; con **Push automático** activo se envían en el acto, y si lo desactivas aparece «Cambios sin push» hasta que pulses **Push al emulador**. En Android se ejecuta `am force-stop`, se copia el archivo a `/data/local/tmp` y se mueve al contenedor con `run-as`; en iOS se cierra la app con `simctl terminate`. Vuelve a abrir la app para ver los cambios.
 
